@@ -28,7 +28,7 @@ const emptyAnalysis = () => ({
   accountSummary: { totalAccounts: '', openAccounts: '', closedAccounts: '', delinquentAccounts: '', derogatoryAccounts: '', collections: '', balances: '', payments: '', publicRecords: '', inquiries: '' },
   tradelines: [], negativeItems: [], positiveItems: [], collections: [], derogatoryItems: [], bureauDifferences: [], rebuildNeeds: []
 });
-let rawText = ''; let analysis = emptyAnalysis(); let approvedAnalysis = null; let approved = false;
+let rawText = ''; let analysis = emptyAnalysis(); let approvedAnalysis = null; let approved = false; let analyzed = false;
 const clean = (value) => String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').replace(/^[|:;,-]+|[|:;,-]+$/g, '').trim();
 const linesOf = (text) => String(text || '').split(/\r?\n/).map(clean).filter(Boolean);
 const escapeReg = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -405,14 +405,6 @@ function makeStrategy(sourceData) {
       derogatory: countOrNeeds(derogatoryCount),
       inquiries: countOrNeeds(summaryInquiries)
     },
-    debug: {
-      clientName: valueOrNeeds(data.clientProfile.clientName),
-      reportDate: valueOrNeeds(data.clientProfile.reportDate),
-      scores: `TU ${valueOrNeeds(data.scores.TransUnion)} | EX ${valueOrNeeds(data.scores.Experian)} | EQ ${valueOrNeeds(data.scores.Equifax)}`,
-      tradelines: countOrNeeds(totalTradelines),
-      positiveItems: countOrNeeds(positiveCount),
-      negativeItems: countOrNeeds(negativeCount)
-    },
     positiveItems: (data.positiveItems || []).map((item) => ({ ...item, role: 'Protect this account. This helps age, payment history, and positive revolving profile.' })),
     negativeItems: negativeWithPriority,
     scoreBlockers: scoreBlockerRanking(data),
@@ -446,9 +438,6 @@ const snapshotText = (snap) => [
   `Inquiries: ${snap.inquiries}`
 ].join('\n');
 const itemSummaryText = (items, empty, formatter) => items.length ? items.map(formatter).join('\n') : empty;
-const disputeHitListText = (strategy) => itemSummaryText(strategy.negativeItems, 'Some items still need manual confirmation before final dispute targeting.', (item, index) => `${index + 1}. ${displayValue(item.creditor, 'Negative reporting flag')} — ${displayValue(item.type)} — ${displayValue(item.status)} — Balance: ${formatMoney(item.balance)}\nPriority: ${item.disputePriority}\nAttack angles: ${item.attackAngles.join(' ')}`);
-const rebuildPlanText = (strategy) => itemSummaryText(strategy.positiveItems, 'Some positive profile details still need manual confirmation before final rebuild targeting.', (item, index) => `${index + 1}. ${displayValue(item.creditor, 'Positive account')} — ${displayValue(item.type)} — ${displayValue(item.status)} — Balance: ${formatMoney(item.balance)} — ${item.role}`);
-const planText = (strategy) => Object.entries(strategy.gamePlan).map(([period, steps]) => `${period}\n${steps.map((step) => `- ${step}`).join('\n')}`).join('\n\n');
 const strategySummaryText = (strategy) => [
   snapshotText(strategy.snapshot),
   '',
@@ -470,9 +459,8 @@ const strategySummaryText = (strategy) => [
 function copyButton(label, textFactory) { return el('button', { class: 'secondary', text: label, onclick: () => copyText(textFactory()) }); }
 
 function input(value, oninput, placeholder = '') { const node = el('input', { value, placeholder }); node.addEventListener('input', (e) => oninput(e.target.value)); return node; }
-function checkbox(label, checked, onchange) { const node = el('input', { type: 'checkbox' }); node.checked = Boolean(checked); node.addEventListener('change', (e) => onchange(e.target.checked)); return el('label', { class: 'check' }, [node, document.createTextNode(label)]); }
-function render() { const root = document.getElementById('root'); root.innerHTML = ''; root.append(el('main', {}, [el('section', { class: 'hero' }, [el('p', { class: 'eyebrow', text: 'Synergy4Life' }), el('h1', { text: 'Credit File Analyzer' }), el('p', { text: 'Paste copied report text, verify extracted fields, then approve a strategic credit game plan. Stage 1 supports pasted text only.' })]), pasteCard(), verificationCard(), strategyCard()])); }
-function pasteCard() { const area = el('textarea', { placeholder: 'Paste IdentityIQ, Credit Hero, SmartCredit, or unknown provider report text here...' }); area.value = rawText; area.addEventListener('input', (e) => rawText = e.target.value); const button = el('button', { text: 'Analyze Credit File', onclick: () => { analysis = parseReport(rawText); approvedAnalysis = null; approved = false; render(); } }); if (!rawText.trim()) button.disabled = true; return el('section', { class: 'card' }, [el('h2', { text: '1. Paste Credit Report Text' }), area, button]); }
+function render() { const root = document.getElementById('root'); const workflow = [pasteCard()]; if (analyzed) workflow.push(verificationCard(), strategyCard()); root.innerHTML = ''; root.append(el('main', {}, [el('section', { class: 'hero' }, [el('p', { class: 'eyebrow', text: 'Synergy4Life' }), el('h1', { text: 'Credit File Analyzer' }), el('p', { text: 'Paste copied report text, verify extracted fields, then approve a strategic credit game plan. Stage 1 supports pasted text only.' })]), ...workflow])); }
+function pasteCard() { const area = el('textarea', { placeholder: 'Paste IdentityIQ, Credit Hero, SmartCredit, or unknown provider report text here...' }); area.value = rawText; area.addEventListener('input', (e) => rawText = e.target.value); const button = el('button', { text: 'Analyze Credit File', onclick: () => { analysis = parseReport(rawText); approvedAnalysis = null; approved = false; analyzed = true; render(); } }); if (!rawText.trim()) button.disabled = true; return el('section', { class: 'card' }, [el('h2', { text: '1. Paste Credit Report Text' }), area, button]); }
 function verificationCard() { const grid = el('div', { class: 'grid' }); [['clientProfile', analysis.clientProfile], ['scores', analysis.scores], ['accountSummary', analysis.accountSummary]].forEach(([section, obj]) => Object.entries(obj).forEach(([key, value]) => grid.append(el('label', {}, [document.createTextNode(labelText(key)), input(value, (v) => { analysis[section][key] = v; approved = false; approvedAnalysis = null; })])))); return el('section', { class: 'card' }, [el('h2', { text: '2. Manual Verification' }), el('p', { class: 'notice', text: 'Review and edit organized data. Strategy stays locked until you click Approve Credit File Analysis. One tradeline can be positive overall while still having negative reporting flags.' }), grid, listEditor('Tradelines', 'tradelines'), listEditor('Positive Items', 'positiveItems'), listEditor('Negative Reporting Flags', 'negativeItems'), listEditor('Collections', 'collections'), listEditor('Derogatory Flags', 'derogatoryItems'), textListEditor('Bureau Differences', 'bureauDifferences'), textListEditor('Rebuild Needs', 'rebuildNeeds'), el('button', { class: 'approve', text: 'Approve Credit File Analysis', onclick: () => { approvedAnalysis = buildApprovedAnalysis(analysis); approved = true; render(); } })]); }
 function touchAnalysis() { approved = false; approvedAnalysis = null; }
 function cloneAccount(row = {}) { return { id: Date.now() + Math.random(), creditor: row.creditor || '', type: row.type || '', balance: row.balance || '', creditLimit: row.creditLimit || '', monthlyPayment: row.monthlyPayment || '', status: row.status || '', bureaus: row.bureaus || '', notes: row.notes || '', raw: row.raw || '' }; }
@@ -491,7 +479,6 @@ function accountControls(key, row, index) { return el('div', { class: 'controls'
   el('button', { class: 'secondary small', text: 'Mark as Negative', onclick: () => markAccount(row, 'negative') }),
   el('button', { class: 'secondary small', text: 'Mark as Both Positive and Negative', onclick: () => markAccount(row, 'both') })
 ]); }
-function updateBureauDraft(draft, bureau, checked) { const set = new Set((draft.bureaus || '').split(',').map(clean).filter(Boolean)); if (checked) set.add(bureau); else set.delete(bureau); draft.bureaus = [...set].join(', '); }
 function listEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} organized yet.` })); analysis[key].forEach((row, i) => { const editor = el('div', { class: 'account-editor collapsed', id: `${key}-${i}` }, [accountFields(row, (fieldName, value) => { analysis[key][i][fieldName] = value; touchAnalysis(); })]); box.append(el('div', { class: 'account-card' }, [el('strong', { text: row.creditor || 'Account needs creditor name' }), el('p', { class: 'muted', text: `${displayValue(row.type)} • ${displayValue(row.status)} • Balance: ${formatMoney(row.balance)}` }), accountControls(key, row, i), editor])); }); return box; }
 function textListEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} organized yet.` })); analysis[key].forEach((row, i) => box.append(input(row, (v) => { analysis[key][i] = v; touchAnalysis(); }))); return box; }
 function field(label, value) { return el('div', { class: 'metric' }, [el('span', { text: label }), el('strong', { text: String(value) })]); }
