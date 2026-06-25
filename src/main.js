@@ -173,7 +173,13 @@ const parsedCount = (value) => {
   const numbers = moneyOrNumber(value);
   return numbers.length ? numbers[0] : '';
 };
-const displayValue = (value, fallback = 'Not verified') => clean(value) || fallback;
+const displayValue = (value, fallback = 'Needs verification') => clean(value) || fallback;
+const hasVerifiedValue = (value) => clean(value) !== '';
+const confirmedNumber = (value) => {
+  if (!hasVerifiedValue(value)) return null;
+  const count = Number(parsedCount(value));
+  return Number.isFinite(count) ? count : null;
+};
 const formatMoney = (value) => displayValue(value);
 const scoreValue = (data, bureau) => displayValue(data.scores[bureau]);
 const itemText = (item) => `${item.creditor || ''} ${item.type || ''} ${item.status || ''} ${item.raw || ''}`;
@@ -183,8 +189,8 @@ const isChargeOff = (item) => /charge.?off|\bco\b/i.test(itemText(item));
 const hasRecentLate = (item) => /late payment|\b(?:30|60|90)\s*(?:days?\s*)?late\b|past due|delinquent|days late/i.test(itemText(item));
 const hasHighUtilization = (item) => /utilization|over limit|maxed|high\s*(?:balance|utilization)|credit\s*limit/i.test(`${item.status} ${item.raw || ''}`);
 const verifiedCount = (value) => {
-  const count = Number(parsedCount(value));
-  return Number.isFinite(count) && count > 0;
+  const count = confirmedNumber(value);
+  return count !== null && count > 0;
 };
 const hasPublicRecords = (data) => verifiedCount(data.accountSummary.publicRecords);
 const hasInquiries = (data) => verifiedCount(data.accountSummary.inquiries);
@@ -277,10 +283,12 @@ function scoreBlockerRanking(data) {
   if (highUtil.length) ranked.push({ title: 'High utilization', detail: `${highUtil.length} verified tradeline(s) include high-utilization language.` });
   if (hasPublicRecords(data)) ranked.push({ title: 'Public records', detail: `Summary reports public records: ${firstValue(data.accountSummary.publicRecords)}.` });
   if (hasInquiries(data)) ranked.push({ title: 'Inquiries', detail: `Summary reports inquiries: ${firstValue(data.accountSummary.inquiries)}.` });
-  if (hasThinFile(data)) ranked.push({ title: 'Thin file / missing positives', detail: `${data.positiveItems.length} positive tradeline(s) verified across ${data.tradelines.length} total tradeline(s).` });
+  if (hasThinFile(data)) ranked.push({ title: 'Thin file / positive profile review', detail: data.positiveItems.length ? `${data.positiveItems.length} positive tradeline(s) verified across ${data.tradelines.length} total tradeline(s).` : 'Some positive profile details still need manual confirmation before final rebuild targeting.' });
   return ranked;
 }
 const plural = (count, singular, pluralText = `${singular}s`) => `${count} ${Number(count) === 1 ? singular : pluralText}`;
+const countPhrase = (count, singular, pluralText) => count === null ? '' : plural(count, singular, pluralText);
+const cleanJoin = (parts, separator = ', ') => parts.map(clean).filter(Boolean).join(separator);
 const rebuildFocus = (data) => {
   const openPositive = data.positiveItems.find((item) => /open|current/i.test(itemText(item))) || data.positiveItems[0];
   const creditor = clean(openPositive?.creditor);
@@ -298,34 +306,60 @@ const disputeFocus = (item) => {
 };
 const verifiedName = (data) => clean(data.clientProfile.clientName);
 function makeStrategy(sourceData) {
-  const data = cloneData(sourceData);
-  const negativeWithPriority = data.negativeItems.map((item) => ({ ...item, whyItHurts: whyItHurts(item), disputePriority: disputePriority(item), attackAngles: attackAngles(item) }));
+  const data = cloneData(sourceData || emptyAnalysis());
+  const negativeWithPriority = (data.negativeItems || []).map((item) => ({ ...item, whyItHurts: whyItHurts(item), disputePriority: disputePriority(item), attackAngles: attackAngles(item) }));
   const firstNegative = negativeWithPriority[0];
-  const approvedCollections = uniqueItems([...(data.collections || []), ...data.negativeItems.filter(isCollection), ...data.tradelines.filter(isCollection)]);
-  const approvedDerogatory = uniqueItems([...(data.derogatoryItems || []), ...data.negativeItems.filter(classifyNegative)]);
-  const collectionCount = approvedCollections.length || (data.tradelines.length || data.negativeItems.length ? 0 : Number(parsedCount(data.accountSummary.collections)) || 0);
-  const derogatoryCount = approvedDerogatory.length || (data.tradelines.length || data.negativeItems.length ? 0 : Number(parsedCount(data.accountSummary.derogatoryAccounts)) || 0);
-  const hasApprovedTradelineData = Boolean(data.tradelines.length || data.positiveItems.length || data.negativeItems.length || approvedCollections.length || approvedDerogatory.length);
-  const totalTradelineCount = data.tradelines.length || uniqueItems([...data.positiveItems, ...data.negativeItems]).length;
-  const displayCount = (count) => hasApprovedTradelineData ? count : 'Not verified';
-  const clientCountPhrase = hasApprovedTradelineData
-    ? `${plural(data.positiveItems.length, 'positive tradeline')} and ${plural(data.negativeItems.length, 'negative reporting flag')}, ${plural(collectionCount || 0, 'collection')} and ${plural(derogatoryCount || 0, 'derogatory item')}`
-    : 'Not verified';
+  const approvedCollections = uniqueItems([...(data.collections || []), ...(data.negativeItems || []).filter(isCollection), ...(data.tradelines || []).filter(isCollection)]);
+  const approvedDerogatory = uniqueItems([...(data.derogatoryItems || []), ...(data.negativeItems || []).filter(classifyNegative)]);
+  const summaryCollections = confirmedNumber(data.accountSummary.collections);
+  const summaryDerogatory = confirmedNumber(data.accountSummary.derogatoryAccounts);
+  const summaryInquiries = confirmedNumber(data.accountSummary.inquiries);
+  const hasApprovedTradelineData = Boolean((data.tradelines || []).length || (data.positiveItems || []).length || (data.negativeItems || []).length || approvedCollections.length || approvedDerogatory.length);
+  const totalTradelineCount = (data.tradelines || []).length || uniqueItems([...(data.positiveItems || []), ...(data.negativeItems || [])]).length;
+  const totalTradelines = hasApprovedTradelineData ? totalTradelineCount : null;
+  const positiveCount = (data.positiveItems || []).length ? data.positiveItems.length : null;
+  const negativeCount = (data.negativeItems || []).length ? data.negativeItems.length : null;
+  const collectionCount = approvedCollections.length ? approvedCollections.length : summaryCollections;
+  const derogatoryCount = approvedDerogatory.length ? approvedDerogatory.length : summaryDerogatory;
+  const valueOrNeeds = (value) => displayValue(value, 'Needs verification');
+  const countOrNeeds = (count) => count === null ? 'Needs verification' : String(count);
+  const blockerTitles = scoreBlockerRanking(data).slice(0, 3).map((b) => b.title.toLowerCase());
   const clientGreeting = verifiedName(data) ? `Hi ${verifiedName(data)},` : 'Hi there,';
+  const approvedCountParts = [
+    countPhrase(totalTradelines, 'total tradeline'),
+    (positiveCount && positiveCount > 0) ? countPhrase(positiveCount, 'positive tradeline') : '',
+    (negativeCount && negativeCount > 0) ? countPhrase(negativeCount, 'negative reporting flag') : '',
+    (collectionCount && collectionCount > 0) ? countPhrase(collectionCount, 'collection') : '',
+    (derogatoryCount && derogatoryCount > 0) ? countPhrase(derogatoryCount, 'derogatory item') : ''
+  ];
+  const reviewedPhrase = cleanJoin(approvedCountParts)
+    ? `I reviewed and organized the credit report details you provided, including ${cleanJoin(approvedCountParts)}.`
+    : 'I reviewed and organized the credit report details provided.';
+  const blockerPhrase = blockerTitles.length
+    ? `The main score blockers showing in the verified data are ${blockerTitles.join(', ')}.`
+    : 'Some items still need manual confirmation before final dispute targeting.';
   return {
     snapshot: {
-      clientName: displayValue(data.clientProfile.clientName),
-      provider: displayValue(data.clientProfile.provider),
-      reportDate: displayValue(data.clientProfile.reportDate),
-      scores: { TU: scoreValue(data, 'TransUnion'), EX: scoreValue(data, 'Experian'), EQ: scoreValue(data, 'Equifax') },
-      totalTradelines: displayCount(totalTradelineCount),
-      positiveTradelines: displayCount(data.positiveItems.length),
-      negativeTradelines: displayCount(data.negativeItems.length),
-      collections: collectionCount || 'Not verified',
-      derogatory: derogatoryCount || 'Not verified',
-      inquiries: parsedCount(data.accountSummary.inquiries) || 'Not verified'
+      clientName: valueOrNeeds(data.clientProfile.clientName),
+      provider: valueOrNeeds(data.clientProfile.provider),
+      reportDate: valueOrNeeds(data.clientProfile.reportDate),
+      scores: { TU: valueOrNeeds(data.scores.TransUnion), EX: valueOrNeeds(data.scores.Experian), EQ: valueOrNeeds(data.scores.Equifax) },
+      totalTradelines: countOrNeeds(totalTradelines),
+      positiveTradelines: countOrNeeds(positiveCount),
+      negativeTradelines: countOrNeeds(negativeCount),
+      collections: countOrNeeds(collectionCount),
+      derogatory: countOrNeeds(derogatoryCount),
+      inquiries: countOrNeeds(summaryInquiries)
     },
-    positiveItems: data.positiveItems.map((item) => ({ ...item, role: 'Protect this account. This helps age, payment history, and positive revolving profile.' })),
+    debug: {
+      clientName: valueOrNeeds(data.clientProfile.clientName),
+      reportDate: valueOrNeeds(data.clientProfile.reportDate),
+      scores: `TU ${valueOrNeeds(data.scores.TransUnion)} | EX ${valueOrNeeds(data.scores.Experian)} | EQ ${valueOrNeeds(data.scores.Equifax)}`,
+      tradelines: countOrNeeds(totalTradelines),
+      positiveItems: countOrNeeds(positiveCount),
+      negativeItems: countOrNeeds(negativeCount)
+    },
+    positiveItems: (data.positiveItems || []).map((item) => ({ ...item, role: 'Protect this account. This helps age, payment history, and positive revolving profile.' })),
     negativeItems: negativeWithPriority,
     scoreBlockers: scoreBlockerRanking(data),
     gamePlan: {
@@ -333,7 +367,7 @@ function makeStrategy(sourceData) {
       '60 Days': ['Review bureau responses and document each result.', 'Compare deleted, verified, updated, or stalled accounts by bureau.', 'Prepare second-round escalation for unresolved factual inaccuracies.'],
       '90 Days': ['Re-pull the report and compare against the approved baseline.', 'Update score blockers using only newly verified data.', 'Complete mortgage/rebuild readiness review.', 'Decide the next dispute or rebuild move.']
     },
-    clientUpdateMessage: `${clientGreeting} I reviewed and organized the credit report details you provided, then verified ${clientCountPhrase}. The main score blockers are ${scoreBlockerRanking(data).slice(0, 3).map((b) => b.title.toLowerCase()).join(', ') || 'not clearly verified yet'}. Our first focus area is ${disputeFocus(firstNegative)}. For rebuild and protection, we’ll ${rebuildFocus(data)}. Over the next 30/60/90 days, we will verify and dispute accurate targets first, review bureau responses, then update the plan from the new verified results.`
+    clientUpdateMessage: `${clientGreeting} ${reviewedPhrase} ${blockerPhrase} Our first focus area is ${disputeFocus(firstNegative)}. For rebuild and protection, we’ll ${rebuildFocus(data)}. Over the next 30/60/90 days, we will verify and dispute accurate targets first, review bureau responses, then update the plan from the new verified results.`
   };
 }
 const el = (tag, attrs = {}, children = []) => { const node = document.createElement(tag); Object.entries(attrs).forEach(([k, v]) => { if (k === 'class') node.className = v; else if (k === 'text') node.textContent = v; else if (k.startsWith('on')) node.addEventListener(k.slice(2), v); else node.setAttribute(k, v); }); children.forEach((c) => node.append(c)); return node; };
@@ -358,20 +392,20 @@ const snapshotText = (snap) => [
   `Inquiries: ${snap.inquiries}`
 ].join('\n');
 const itemSummaryText = (items, empty, formatter) => items.length ? items.map(formatter).join('\n') : empty;
-const disputeHitListText = (strategy) => itemSummaryText(strategy.negativeItems, 'No negative reporting flags verified.', (item, index) => `${index + 1}. ${displayValue(item.creditor, 'Negative reporting flag')} — ${displayValue(item.type)} — ${displayValue(item.status)} — Balance: ${formatMoney(item.balance)}\nPriority: ${item.disputePriority}\nAttack angles: ${item.attackAngles.join(' ')}`);
-const rebuildPlanText = (strategy) => itemSummaryText(strategy.positiveItems, 'No positive tradelines verified.', (item, index) => `${index + 1}. ${displayValue(item.creditor, 'Positive account')} — ${displayValue(item.type)} — ${displayValue(item.status)} — Balance: ${formatMoney(item.balance)} — ${item.role}`);
+const disputeHitListText = (strategy) => itemSummaryText(strategy.negativeItems, 'Some items still need manual confirmation before final dispute targeting.', (item, index) => `${index + 1}. ${displayValue(item.creditor, 'Negative reporting flag')} — ${displayValue(item.type)} — ${displayValue(item.status)} — Balance: ${formatMoney(item.balance)}\nPriority: ${item.disputePriority}\nAttack angles: ${item.attackAngles.join(' ')}`);
+const rebuildPlanText = (strategy) => itemSummaryText(strategy.positiveItems, 'Some positive profile details still need manual confirmation before final rebuild targeting.', (item, index) => `${index + 1}. ${displayValue(item.creditor, 'Positive account')} — ${displayValue(item.type)} — ${displayValue(item.status)} — Balance: ${formatMoney(item.balance)} — ${item.role}`);
 const planText = (strategy) => Object.entries(strategy.gamePlan).map(([period, steps]) => `${period}\n${steps.map((step) => `- ${step}`).join('\n')}`).join('\n\n');
 const strategySummaryText = (strategy) => [
   snapshotText(strategy.snapshot),
   '',
   'Positive Items',
-  itemSummaryText(strategy.positiveItems, 'No positive tradelines verified.', (item, index) => `${index + 1}. ${displayValue(item.creditor, 'Positive account')} — ${displayValue(item.type)} — ${displayValue(item.status)} — Balance: ${formatMoney(item.balance)} — ${item.role}`),
+  itemSummaryText(strategy.positiveItems, 'Some positive profile details still need manual confirmation before final rebuild targeting.', (item, index) => `${index + 1}. ${displayValue(item.creditor, 'Positive account')} — ${displayValue(item.type)} — ${displayValue(item.status)} — Balance: ${formatMoney(item.balance)} — ${item.role}`),
   '',
   'Dispute Hit List',
-  itemSummaryText(strategy.negativeItems, 'No negative reporting flags verified.', (item, index) => `${index + 1}. ${displayValue(item.creditor, 'Negative account')} — ${displayValue(item.type)} — ${displayValue(item.status)} — Balance: ${formatMoney(item.balance)}\n   Why it hurts: ${item.whyItHurts}\n   Priority: ${item.disputePriority}\n   Attack angles: ${item.attackAngles.join(' ')}`),
+  itemSummaryText(strategy.negativeItems, 'Some items still need manual confirmation before final dispute targeting.', (item, index) => `${index + 1}. ${displayValue(item.creditor, 'Negative account')} — ${displayValue(item.type)} — ${displayValue(item.status)} — Balance: ${formatMoney(item.balance)}\n   Why it hurts: ${item.whyItHurts}\n   Priority: ${item.disputePriority}\n   Attack angles: ${item.attackAngles.join(' ')}`),
   '',
   'Score Blocker Ranking',
-  strategy.scoreBlockers.length ? strategy.scoreBlockers.map((blocker, index) => `${index + 1}. ${blocker.title}: ${blocker.detail}`).join('\n') : 'No score blockers verified.',
+  strategy.scoreBlockers.length ? strategy.scoreBlockers.map((blocker, index) => `${index + 1}. ${blocker.title}: ${blocker.detail}`).join('\n') : 'Some items still need manual confirmation before final dispute targeting.',
   '',
   '30/60/90 Plan',
   Object.entries(strategy.gamePlan).map(([period, steps]) => `${period}\n${steps.map((step) => `- ${step}`).join('\n')}`).join('\n\n'),
@@ -414,11 +448,12 @@ function emptyState(text) { return el('p', { class: 'muted empty', text }); }
 function strategySection(title, children) { return el('div', { class: 'strategy-section' }, [el('h3', { text: title }), ...children]); }
 function strategyCard() {
   const box = el('section', { class: `card strategy ${approved ? '' : 'locked'}` }, [el('h2', { text: '3. Strategy & 30/60/90 Game Plan' })]);
-  if (!approved) {
+  if (!approved || !approvedAnalysis) {
     box.append(el('p', { class: 'notice', text: 'Approve the verified credit file analysis to generate strategy.' }));
     return box;
   }
-  const strategy = makeStrategy(approvedAnalysis || buildApprovedAnalysis(analysis));
+  box.append(el('p', { class: 'approval-confirmation', text: 'Credit file analysis approved. Strategy generated from verified fields.' }));
+  const strategy = makeStrategy(approvedAnalysis);
   const snap = strategy.snapshot;
   box.append(strategySection('Credit File Snapshot', [
     el('div', { class: 'snapshot-grid' }, [
@@ -430,11 +465,11 @@ function strategyCard() {
   ]));
   box.append(strategySection('Positive Credit Profile', strategy.positiveItems.length ? strategy.positiveItems.map((item) => itemCard(item.creditor || 'Positive account', [
     ['Creditor', displayValue(item.creditor)], ['Account type', displayValue(item.type)], ['Balance', formatMoney(item.balance)], ['Status', displayValue(item.status)], ['Role in strategy', item.role]
-  ])) : [emptyState('No positive tradelines were verified in the approved manual data.')]));
+  ])) : [emptyState('Some positive profile details still need manual confirmation before final rebuild targeting.')]));
   box.append(strategySection('Negative Reporting Flag Attack Plan', strategy.negativeItems.length ? strategy.negativeItems.map((item) => itemCard(item.creditor || 'Negative account', [
     ['Creditor', displayValue(item.creditor)], ['Account type', displayValue(item.type)], ['Balance', formatMoney(item.balance)], ['Status', displayValue(item.status)], ['Why it hurts', item.whyItHurts], ['Dispute priority', item.disputePriority]
-  ], [el('div', { class: 'angles' }, [el('span', { text: 'Factual attack angles' }), el('ul', {}, item.attackAngles.map((angle) => el('li', { text: angle })))])])) : [emptyState('No negative reporting flags were verified in the approved manual data.')]));
-  box.append(strategySection('Score Blocker Ranking', strategy.scoreBlockers.length ? [el('div', { class: 'rank-list' }, strategy.scoreBlockers.map((blocker, index) => el('article', { class: 'rank-card' }, [el('strong', { text: `${index + 1}. ${blocker.title}` }), el('p', { text: blocker.detail })])))] : [emptyState('No score blockers were verified from the approved manual verification data.')]));
+  ], [el('div', { class: 'angles' }, [el('span', { text: 'Factual attack angles' }), el('ul', {}, item.attackAngles.map((angle) => el('li', { text: angle })))])])) : [emptyState('Some items still need manual confirmation before final dispute targeting.')]));
+  box.append(strategySection('Score Blocker Ranking', strategy.scoreBlockers.length ? [el('div', { class: 'rank-list' }, strategy.scoreBlockers.map((blocker, index) => el('article', { class: 'rank-card' }, [el('strong', { text: `${index + 1}. ${blocker.title}` }), el('p', { text: blocker.detail })])))] : [emptyState('Some items still need manual confirmation before final dispute targeting.')]));
   box.append(strategySection('30/60/90 Game Plan', Object.entries(strategy.gamePlan).map(([period, steps]) => el('article', { class: 'plan-card' }, [el('h4', { text: period }), el('ul', {}, steps.map((step) => el('li', { text: step }))) ]))));
   box.append(strategySection('Client Update Message', [el('div', { class: 'client-message', text: strategy.clientUpdateMessage }), copyButton('Copy Client Update Message', () => strategy.clientUpdateMessage)]));
   box.append(strategySection('Copy Strategy Outputs', [
@@ -442,6 +477,19 @@ function strategyCard() {
     copyButton('Copy Rebuild Plan', () => rebuildPlanText(strategy)),
     copyButton('Copy 30/60/90 Plan', () => planText(strategy)),
     copyButton('Copy Full Strategy Summary', () => strategySummaryText(strategy))
+  ]));
+  box.append(strategySection('Approved Data Check', [
+    el('details', { class: 'approved-data-check' }, [
+      el('summary', { text: 'Approved Data Check' }),
+      el('div', { class: 'snapshot-grid' }, [
+        field('Client name used', strategy.debug.clientName),
+        field('Report date used', strategy.debug.reportDate),
+        field('Scores used', strategy.debug.scores),
+        field('Tradelines used', strategy.debug.tradelines),
+        field('Positive items used', strategy.debug.positiveItems),
+        field('Negative items used', strategy.debug.negativeItems)
+      ])
+    ])
   ]));
   return box;
 }
