@@ -26,9 +26,9 @@ const emptyAnalysis = () => ({
   clientProfile: { provider: 'Unknown', clientName: '', reportDate: '' },
   scores: { TransUnion: '', Experian: '', Equifax: '' },
   accountSummary: { totalAccounts: '', openAccounts: '', closedAccounts: '', delinquentAccounts: '', derogatoryAccounts: '', collections: '', balances: '', payments: '', publicRecords: '', inquiries: '' },
-  tradelines: [], negativeItems: [], positiveItems: [], bureauDifferences: [], rebuildNeeds: []
+  tradelines: [], negativeItems: [], positiveItems: [], collections: [], derogatoryItems: [], bureauDifferences: [], rebuildNeeds: []
 });
-let rawText = ''; let analysis = emptyAnalysis(); let approved = false;
+let rawText = ''; let analysis = emptyAnalysis(); let approvedAnalysis = null; let approved = false;
 const clean = (value) => String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').replace(/^[|:;,-]+|[|:;,-]+$/g, '').trim();
 const linesOf = (text) => String(text || '').split(/\r?\n/).map(clean).filter(Boolean);
 const escapeReg = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -162,6 +162,8 @@ function parseReport(text) {
   return {
     clientProfile: { provider, clientName: valueAfterLabel(personal || text, ['Client Name', 'Consumer Name', 'Name']), reportDate: valueAfterLabel(text, ['Credit Report Date', 'Report Date', 'Date Pulled', 'Prepared For Date']) },
     scores: parseScores(text), accountSummary, tradelines, negativeItems, positiveItems,
+    collections: negativeItems.filter((item) => /collection/i.test(`${item.type} ${item.status} ${item.raw}`)),
+    derogatoryItems: negativeItems.filter((item) => /derogatory|charge.?off|collection|late|delinquent|repossession|foreclosure/i.test(`${item.type} ${item.status} ${item.raw}`)),
     bureauDifferences: tradelines.filter((t) => t.bureaus && t.bureaus.split(',').length < 3).map((t) => `${t.creditor}: appears to vary by bureau (${t.bureaus || 'bureau not specified'}).`),
     rebuildNeeds: []
   };
@@ -175,10 +177,11 @@ const displayValue = (value, fallback = 'Not verified') => clean(value) || fallb
 const formatMoney = (value) => displayValue(value);
 const scoreValue = (data, bureau) => displayValue(data.scores[bureau]);
 const itemText = (item) => `${item.creditor || ''} ${item.type || ''} ${item.status || ''} ${item.raw || ''}`;
+const isVerifiedItem = (item) => Boolean(clean(item?.creditor) || clean(item?.type) || clean(item?.balance) || clean(item?.status) || clean(item?.raw));
 const isCollection = (item) => /collection/i.test(itemText(item));
 const isChargeOff = (item) => /charge.?off|\bco\b/i.test(itemText(item));
 const hasRecentLate = (item) => /late payment|\b(?:30|60|90)\s*(?:days?\s*)?late\b|past due|delinquent|days late/i.test(itemText(item));
-const hasHighUtilization = (item) => /utilization|over limit|maxed/i.test(`${item.status} ${item.raw || ''}`);
+const hasHighUtilization = (item) => /utilization|over limit|maxed|high\s*(?:balance|utilization)|credit\s*limit/i.test(`${item.status} ${item.raw || ''}`);
 const verifiedCount = (value) => {
   const count = Number(parsedCount(value));
   return Number.isFinite(count) && count > 0;
@@ -186,6 +189,53 @@ const verifiedCount = (value) => {
 const hasPublicRecords = (data) => verifiedCount(data.accountSummary.publicRecords);
 const hasInquiries = (data) => verifiedCount(data.accountSummary.inquiries);
 const hasThinFile = (data) => data.tradelines.length > 0 && data.positiveItems.length < 2;
+
+function cloneData(source) {
+  return typeof structuredClone === 'function' ? structuredClone(source) : JSON.parse(JSON.stringify(source));
+}
+function ensureList(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === 'string' ? clean(item) : isVerifiedItem(item)) : [];
+}
+function uniqueItems(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    const key = clean(`${item.creditor}|${item.type}|${item.balance}|${item.status}|${item.raw}` || JSON.stringify(item)).toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+function classifyNegative(item) {
+  return /charge.?off|collection|late|derogatory|delinquent|repossession|foreclosure|past due|\b(?:30|60|90|120)\b/i.test(itemText(item));
+}
+function classifyPositive(item) {
+  return /current|paid|open|never late|pays as agreed/i.test(itemText(item)) && !classifyNegative(item);
+}
+function buildApprovedAnalysis(current) {
+  const source = cloneData(current || emptyAnalysis());
+  const tradelines = ensureList(source.tradelines);
+  const manualPositive = ensureList(source.positiveItems);
+  const manualNegative = ensureList(source.negativeItems);
+  const derivedNegative = tradelines.filter(classifyNegative);
+  const derivedPositive = tradelines.filter(classifyPositive);
+  const negativeItems = uniqueItems([...manualNegative, ...derivedNegative]);
+  const positiveItems = uniqueItems([...manualPositive, ...derivedPositive]);
+  const collections = uniqueItems([...ensureList(source.collections), ...negativeItems.filter(isCollection), ...tradelines.filter(isCollection)]);
+  const derogatoryItems = uniqueItems([...ensureList(source.derogatoryItems), ...negativeItems.filter(classifyNegative), ...tradelines.filter(classifyNegative)]);
+  return {
+    clientProfile: { ...emptyAnalysis().clientProfile, ...(source.clientProfile || {}) },
+    scores: { ...emptyAnalysis().scores, ...(source.scores || {}) },
+    accountSummary: { ...emptyAnalysis().accountSummary, ...(source.accountSummary || {}) },
+    tradelines,
+    positiveItems,
+    negativeItems,
+    collections,
+    derogatoryItems,
+    bureauDifferences: ensureList(source.bureauDifferences),
+    rebuildNeeds: ensureList(source.rebuildNeeds)
+  };
+}
+
 function attackAngles(item) {
   const base = isCollection(item)
     ? ['Verify ownership.', 'Verify original creditor.', 'Verify balance.', 'Verify dates.', 'Verify collection authority.', 'Verify account status.', 'Verify bureau-level reporting accuracy.']
@@ -209,18 +259,23 @@ function disputePriority(item) {
 }
 function scoreBlockerRanking(data) {
   const ranked = [];
-  const recentLates = data.negativeItems.filter(hasRecentLate);
+  const negativeItems = data.negativeItems || [];
+  const tradelines = data.tradelines || [];
+  const recentLates = negativeItems.filter(hasRecentLate);
   if (recentLates.length) ranked.push({ title: 'Recent late payments', detail: `${recentLates.length} verified negative item(s) show late-payment or delinquency language.` });
-  const collections = data.negativeItems.filter(isCollection);
+  const collections = uniqueItems([...(data.collections || []), ...negativeItems.filter(isCollection), ...tradelines.filter(isCollection)]);
   const summaryCollections = firstValue(data.accountSummary.collections);
-  if (collections.length || verifiedCount(data.accountSummary.collections)) ranked.push({ title: 'Collections', detail: collections.length ? `${collections.length} collection tradeline(s) parsed.` : `Summary reports collections: ${summaryCollections}.` });
-  const chargeOffs = data.negativeItems.filter(isChargeOff);
-  if (chargeOffs.length) ranked.push({ title: 'Charge-offs', detail: `${chargeOffs.length} charge-off item(s) parsed.` });
-  const highUtil = data.tradelines.filter(hasHighUtilization);
-  if (highUtil.length) ranked.push({ title: 'High utilization', detail: `${highUtil.length} parsed tradeline(s) include high-utilization language.` });
+  if (collections.length || verifiedCount(data.accountSummary.collections)) ranked.push({ title: 'Collections', detail: collections.length ? `${collections.length} collection tradeline(s) verified.` : `Summary reports collections: ${summaryCollections}.` });
+  const chargeOffs = negativeItems.filter(isChargeOff);
+  if (chargeOffs.length) ranked.push({ title: 'Charge-offs', detail: `${chargeOffs.length} charge-off item(s) verified.` });
+  const derogatoryItems = uniqueItems([...(data.derogatoryItems || []), ...negativeItems.filter(classifyNegative)]);
+  if (derogatoryItems.length && !recentLates.length && !collections.length && !chargeOffs.length) ranked.push({ title: 'Derogatory reporting', detail: `${derogatoryItems.length} verified derogatory item(s) need factual review.` });
+  if (negativeItems.length && !recentLates.length && !collections.length && !chargeOffs.length && !derogatoryItems.length) ranked.push({ title: 'Negative tradelines', detail: `${negativeItems.length} verified negative tradeline(s) need factual review.` });
+  const highUtil = uniqueItems([...tradelines, ...(data.positiveItems || []), ...negativeItems]).filter(hasHighUtilization);
+  if (highUtil.length) ranked.push({ title: 'High utilization', detail: `${highUtil.length} verified tradeline(s) include high-utilization language.` });
   if (hasPublicRecords(data)) ranked.push({ title: 'Public records', detail: `Summary reports public records: ${firstValue(data.accountSummary.publicRecords)}.` });
   if (hasInquiries(data)) ranked.push({ title: 'Inquiries', detail: `Summary reports inquiries: ${firstValue(data.accountSummary.inquiries)}.` });
-  if (hasThinFile(data)) ranked.push({ title: 'Thin file / missing positives', detail: `${data.positiveItems.length} positive tradeline(s) parsed across ${data.tradelines.length} total tradeline(s).` });
+  if (hasThinFile(data)) ranked.push({ title: 'Thin file / missing positives', detail: `${data.positiveItems.length} positive tradeline(s) verified across ${data.tradelines.length} total tradeline(s).` });
   return ranked;
 }
 const plural = (count, singular, pluralText = `${singular}s`) => `${count} ${Number(count) === 1 ? singular : pluralText}`;
@@ -241,10 +296,19 @@ const disputeFocus = (item) => {
 };
 const verifiedName = (data) => clean(data.clientProfile.clientName);
 function makeStrategy(sourceData) {
-  const data = typeof structuredClone === 'function' ? structuredClone(sourceData) : JSON.parse(JSON.stringify(sourceData));
+  const data = cloneData(sourceData);
   const negativeWithPriority = data.negativeItems.map((item) => ({ ...item, whyItHurts: whyItHurts(item), disputePriority: disputePriority(item), attackAngles: attackAngles(item) }));
   const firstNegative = negativeWithPriority[0];
-  const collectionChargeOffCount = data.negativeItems.filter((item) => isCollection(item) || isChargeOff(item)).length || Number(parsedCount(data.accountSummary.collections)) || 0;
+  const approvedCollections = uniqueItems([...(data.collections || []), ...data.negativeItems.filter(isCollection), ...data.tradelines.filter(isCollection)]);
+  const approvedDerogatory = uniqueItems([...(data.derogatoryItems || []), ...data.negativeItems.filter(classifyNegative)]);
+  const collectionCount = approvedCollections.length || (data.tradelines.length || data.negativeItems.length ? 0 : Number(parsedCount(data.accountSummary.collections)) || 0);
+  const derogatoryCount = approvedDerogatory.length || (data.tradelines.length || data.negativeItems.length ? 0 : Number(parsedCount(data.accountSummary.derogatoryAccounts)) || 0);
+  const hasApprovedTradelineData = Boolean(data.tradelines.length || data.positiveItems.length || data.negativeItems.length || approvedCollections.length || approvedDerogatory.length);
+  const totalTradelineCount = data.tradelines.length || uniqueItems([...data.positiveItems, ...data.negativeItems]).length;
+  const displayCount = (count) => hasApprovedTradelineData ? count : 'Not verified';
+  const clientCountPhrase = hasApprovedTradelineData
+    ? `${plural(data.positiveItems.length, 'positive tradeline')} and ${plural(data.negativeItems.length, 'negative tradeline')}, ${plural(collectionCount || 0, 'collection')} and ${plural(derogatoryCount || 0, 'derogatory item')}`
+    : 'Not verified';
   const clientGreeting = verifiedName(data) ? `Hi ${verifiedName(data)},` : 'Hi there,';
   return {
     snapshot: {
@@ -252,11 +316,11 @@ function makeStrategy(sourceData) {
       provider: displayValue(data.clientProfile.provider),
       reportDate: displayValue(data.clientProfile.reportDate),
       scores: { TU: scoreValue(data, 'TransUnion'), EX: scoreValue(data, 'Experian'), EQ: scoreValue(data, 'Equifax') },
-      totalTradelines: data.tradelines.length,
-      positiveTradelines: data.positiveItems.length,
-      negativeTradelines: data.negativeItems.length,
-      collections: parsedCount(data.accountSummary.collections) || data.negativeItems.filter(isCollection).length,
-      derogatory: parsedCount(data.accountSummary.derogatoryAccounts) || data.negativeItems.length,
+      totalTradelines: displayCount(totalTradelineCount),
+      positiveTradelines: displayCount(data.positiveItems.length),
+      negativeTradelines: displayCount(data.negativeItems.length),
+      collections: collectionCount || 'Not verified',
+      derogatory: derogatoryCount || 'Not verified',
       inquiries: parsedCount(data.accountSummary.inquiries) || 'Not verified'
     },
     positiveItems: data.positiveItems.map((item) => ({ ...item, role: 'Protect this account. This helps age, payment history, and positive revolving profile.' })),
@@ -267,7 +331,7 @@ function makeStrategy(sourceData) {
       '60 Days': ['Review bureau responses and document each result.', 'Compare deleted, verified, updated, or stalled accounts by bureau.', 'Prepare second-round escalation for unresolved factual inaccuracies.'],
       '90 Days': ['Re-pull the report and compare against the approved baseline.', 'Update score blockers using only newly verified data.', 'Complete mortgage/rebuild readiness review.', 'Decide the next dispute or rebuild move.']
     },
-    clientUpdateMessage: `${clientGreeting} your credit file review is organized. I verified ${plural(data.positiveItems.length, 'positive account')} and ${plural(data.negativeItems.length, 'negative account')}${collectionChargeOffCount ? `, including ${plural(collectionChargeOffCount, 'collection/charge-off account')}` : ''}. Our first focus will be ${disputeFocus(firstNegative)}. We’ll also ${rebuildFocus(data)} while we work through the 30/60/90 plan.`
+    clientUpdateMessage: `${clientGreeting} your credit file review is organized. I verified ${clientCountPhrase}. Our first focus will be ${disputeFocus(firstNegative)}. We’ll also ${rebuildFocus(data)} while we work through the 30/60/90 plan.`
   };
 }
 const el = (tag, attrs = {}, children = []) => { const node = document.createElement(tag); Object.entries(attrs).forEach(([k, v]) => { if (k === 'class') node.className = v; else if (k === 'text') node.textContent = v; else if (k.startsWith('on')) node.addEventListener(k.slice(2), v); else node.setAttribute(k, v); }); children.forEach((c) => node.append(c)); return node; };
@@ -314,8 +378,8 @@ function copyButton(label, textFactory) { return el('button', { class: 'secondar
 
 function input(value, oninput, placeholder = '') { const node = el('input', { value, placeholder }); node.addEventListener('input', (e) => oninput(e.target.value)); return node; }
 function render() { const root = document.getElementById('root'); root.innerHTML = ''; root.append(el('main', {}, [el('section', { class: 'hero' }, [el('p', { class: 'eyebrow', text: 'Synergy4Life' }), el('h1', { text: 'Credit File Analyzer' }), el('p', { text: 'Paste copied report text, verify extracted fields, then approve a strategic credit game plan. Stage 1 supports pasted text only.' })]), pasteCard(), verificationCard(), strategyCard()])); }
-function pasteCard() { const area = el('textarea', { placeholder: 'Paste IdentityIQ, Credit Hero, SmartCredit, or unknown provider report text here...' }); area.value = rawText; area.addEventListener('input', (e) => rawText = e.target.value); const button = el('button', { text: 'Analyze Credit File', onclick: () => { analysis = parseReport(rawText); approved = false; render(); } }); if (!rawText.trim()) button.disabled = true; return el('section', { class: 'card' }, [el('h2', { text: '1. Paste Credit Report Text' }), area, button]); }
-function verificationCard() { const grid = el('div', { class: 'grid' }); [['clientProfile', analysis.clientProfile], ['scores', analysis.scores], ['accountSummary', analysis.accountSummary]].forEach(([section, obj]) => Object.entries(obj).forEach(([key, value]) => grid.append(el('label', {}, [document.createTextNode(labelText(key)), input(value, (v) => { analysis[section][key] = v; })])))); return el('section', { class: 'card' }, [el('h2', { text: '2. Manual Verification' }), el('p', { class: 'notice', text: 'Review and edit parsed data. Strategy stays locked until approval.' }), grid, listEditor('Tradelines', 'tradelines'), listEditor('Positive Items', 'positiveItems'), listEditor('Negative Items', 'negativeItems'), textListEditor('Bureau Differences', 'bureauDifferences'), el('button', { class: 'approve', text: 'Approve Credit File Analysis', onclick: () => { approved = true; render(); } })]); }
+function pasteCard() { const area = el('textarea', { placeholder: 'Paste IdentityIQ, Credit Hero, SmartCredit, or unknown provider report text here...' }); area.value = rawText; area.addEventListener('input', (e) => rawText = e.target.value); const button = el('button', { text: 'Analyze Credit File', onclick: () => { analysis = parseReport(rawText); approvedAnalysis = null; approved = false; render(); } }); if (!rawText.trim()) button.disabled = true; return el('section', { class: 'card' }, [el('h2', { text: '1. Paste Credit Report Text' }), area, button]); }
+function verificationCard() { const grid = el('div', { class: 'grid' }); [['clientProfile', analysis.clientProfile], ['scores', analysis.scores], ['accountSummary', analysis.accountSummary]].forEach(([section, obj]) => Object.entries(obj).forEach(([key, value]) => grid.append(el('label', {}, [document.createTextNode(labelText(key)), input(value, (v) => { analysis[section][key] = v; })])))); return el('section', { class: 'card' }, [el('h2', { text: '2. Manual Verification' }), el('p', { class: 'notice', text: 'Review and edit parsed data. Strategy stays locked until approval.' }), grid, listEditor('Tradelines', 'tradelines'), listEditor('Positive Items', 'positiveItems'), listEditor('Negative Items', 'negativeItems'), listEditor('Collections', 'collections'), listEditor('Derogatory Items', 'derogatoryItems'), textListEditor('Bureau Differences', 'bureauDifferences'), textListEditor('Rebuild Needs', 'rebuildNeeds'), el('button', { class: 'approve', text: 'Approve Credit File Analysis', onclick: () => { approvedAnalysis = buildApprovedAnalysis(analysis); approved = true; render(); } })]); }
 function listEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} parsed.` })); analysis[key].forEach((row, i) => box.append(el('div', { class: 'row' }, [input(row.creditor || '', (v) => analysis[key][i].creditor = v, 'creditor'), input(row.type || '', (v) => analysis[key][i].type = v, 'type'), input(row.balance || '', (v) => analysis[key][i].balance = v, 'balance'), input(row.status || '', (v) => analysis[key][i].status = v, 'status')]))); return box; }
 function textListEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} parsed.` })); analysis[key].forEach((row, i) => box.append(input(row, (v) => analysis[key][i] = v))); return box; }
 function field(label, value) { return el('div', { class: 'metric' }, [el('span', { text: label }), el('strong', { text: String(value) })]); }
@@ -328,23 +392,23 @@ function strategyCard() {
     box.append(el('p', { class: 'notice', text: 'Approve the verified credit file analysis to generate strategy.' }));
     return box;
   }
-  const strategy = makeStrategy(analysis);
+  const strategy = makeStrategy(approvedAnalysis || buildApprovedAnalysis(analysis));
   const snap = strategy.snapshot;
   box.append(strategySection('Credit File Snapshot', [
     el('div', { class: 'snapshot-grid' }, [
       field('Client name', snap.clientName), field('Provider', snap.provider), field('Report date', snap.reportDate),
       field('TU score', snap.scores.TU), field('EX score', snap.scores.EX), field('EQ score', snap.scores.EQ),
-      field('Total tradelines parsed', snap.totalTradelines), field('Positive tradelines', snap.positiveTradelines), field('Negative tradelines', snap.negativeTradelines),
+      field('Total tradelines verified', snap.totalTradelines), field('Positive tradelines', snap.positiveTradelines), field('Negative tradelines', snap.negativeTradelines),
       field('Collections', snap.collections), field('Derogatory', snap.derogatory), field('Inquiries', snap.inquiries)
     ])
   ]));
   box.append(strategySection('Positive Credit Profile', strategy.positiveItems.length ? strategy.positiveItems.map((item) => itemCard(item.creditor || 'Positive account', [
     ['Creditor', displayValue(item.creditor)], ['Account type', displayValue(item.type)], ['Balance', formatMoney(item.balance)], ['Status', displayValue(item.status)], ['Role in strategy', item.role]
-  ])) : [emptyState('No positive tradelines were parsed or manually entered.')]));
+  ])) : [emptyState('No positive tradelines were verified in the approved manual data.')]));
   box.append(strategySection('Negative Account Attack Plan', strategy.negativeItems.length ? strategy.negativeItems.map((item) => itemCard(item.creditor || 'Negative account', [
     ['Creditor', displayValue(item.creditor)], ['Account type', displayValue(item.type)], ['Balance', formatMoney(item.balance)], ['Status', displayValue(item.status)], ['Why it hurts', item.whyItHurts], ['Dispute priority', item.disputePriority]
-  ], [el('div', { class: 'angles' }, [el('span', { text: 'Factual attack angles' }), el('ul', {}, item.attackAngles.map((angle) => el('li', { text: angle })))])])) : [emptyState('No negative tradelines were parsed or manually entered.')]));
-  box.append(strategySection('Score Blocker Ranking', strategy.scoreBlockers.length ? [el('div', { class: 'rank-list' }, strategy.scoreBlockers.map((blocker, index) => el('article', { class: 'rank-card' }, [el('strong', { text: `${index + 1}. ${blocker.title}` }), el('p', { text: blocker.detail })])))] : [emptyState('No score blockers were verified from the parsed or manually entered data.')]));
+  ], [el('div', { class: 'angles' }, [el('span', { text: 'Factual attack angles' }), el('ul', {}, item.attackAngles.map((angle) => el('li', { text: angle })))])])) : [emptyState('No negative tradelines were verified in the approved manual data.')]));
+  box.append(strategySection('Score Blocker Ranking', strategy.scoreBlockers.length ? [el('div', { class: 'rank-list' }, strategy.scoreBlockers.map((blocker, index) => el('article', { class: 'rank-card' }, [el('strong', { text: `${index + 1}. ${blocker.title}` }), el('p', { text: blocker.detail })])))] : [emptyState('No score blockers were verified from the approved manual verification data.')]));
   box.append(strategySection('30/60/90 Game Plan', Object.entries(strategy.gamePlan).map(([period, steps]) => el('article', { class: 'plan-card' }, [el('h4', { text: period }), el('ul', {}, steps.map((step) => el('li', { text: step }))) ]))));
   box.append(strategySection('Client Update Message', [el('div', { class: 'client-message', text: strategy.clientUpdateMessage }), copyButton('Copy Client Update Message', () => strategy.clientUpdateMessage)]));
   box.append(copyButton('Copy Strategy Summary', () => strategySummaryText(strategy)));
