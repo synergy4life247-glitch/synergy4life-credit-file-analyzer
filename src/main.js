@@ -114,6 +114,14 @@ function isCreditorCandidate(line) {
   if (/\b(accounts?|balances?|payments?|records?|inquiries?|delinquent|derogatory)\b/i.test(line) && /\d/.test(line)) return false;
   return /[A-Za-z0-9]{2,}/.test(line) && line.length <= 90;
 }
+function isAccountStartCandidate(line) {
+  const lower = clean(line).toLowerCase();
+  if (!line || isAccountType(line) || line.includes(':')) return false;
+  if (/^(none reported|back to top|days late|ok\b|co\b|jan-|feb-|mar-|apr-|may-|jun-|jul-|aug-|sep-|oct-|nov-|dec-)/i.test(line)) return false;
+  if (/^[\d\s$,.:-]+$/.test(line)) return false;
+  if (/^(credit score|personal information|account summary|account history|inquiries|public information)$/i.test(line)) return false;
+  return /[A-Za-z0-9]{2,}/.test(line) && line.length <= 90;
+}
 function nextValueInBlock(block, labels) { return valueAfterLabel(block.join('\n'), labels); }
 function findNextAccountType(lines, start) {
   for (let i = start; i < lines.length; i++) if (isAccountType(lines[i])) return i;
@@ -124,6 +132,52 @@ function parseTradelines(text) {
   if (!accountHistory) return [];
   const lines = linesOf(accountHistory).filter(line => !/^Account History$/i.test(line));
   const accounts = [];
+  const pushAccount = (creditor, block) => {
+    if (!creditor || !block.length) return;
+    const joined = block.join('\n');
+    const type = nextValueInBlock(block, ['Account Type']) || (block.find(isAccountType) || '');
+    const status = nextValueInBlock(block, ['Status', 'Account Status', 'Account Rating']);
+    const paymentStatus = nextValueInBlock(block, ['Payment Status']);
+    const balance = nextValueInBlock(block, ['Balance Owed', 'Current Balance', 'Balance', 'High Balance']);
+    const creditLimit = nextValueInBlock(block, ['Credit Limit', 'Credit Line', 'Limit']);
+    const monthlyPayment = nextValueInBlock(block, ['Monthly Payment', 'Payment Amount']);
+    const originalCreditor = nextValueInBlock(block, ['Original Creditor']);
+    const bureaus = nextValueInBlock(block, ['Bureau Reporting']) || BUREAUS.filter((b) => new RegExp(b, 'i').test(joined)).join(', ');
+    accounts.push({
+      id: accounts.length + 1,
+      creditor,
+      type,
+      status: clean(status || paymentStatus || type),
+      paymentStatus,
+      balance,
+      creditLimit,
+      monthlyPayment,
+      originalCreditor,
+      bureaus,
+      raw: joined
+    });
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const creditor = lines[i];
+    if (!isAccountStartCandidate(creditor)) continue;
+    const lookahead = lines.slice(i + 1, Math.min(lines.length, i + 8)).join('\n');
+    if (!/Account Type\s*:|Payment Status\s*:|Bureau Reporting\s*:|Balance\s*:/i.test(lookahead)) continue;
+    let end = lines.length;
+    for (let j = i + 1; j < lines.length; j++) {
+      const candidate = lines[j];
+      const nextLookahead = lines.slice(j + 1, Math.min(lines.length, j + 8)).join('\n');
+      if (isAccountStartCandidate(candidate) && /Account Type\s*:|Payment Status\s*:|Bureau Reporting\s*:|Balance\s*:/i.test(nextLookahead)) {
+        end = j;
+        break;
+      }
+    }
+    pushAccount(creditor, lines.slice(i + 1, end));
+    i = end - 1;
+  }
+
+  if (accounts.length) return accounts;
+
   for (let i = 0; i < lines.length; i++) {
     if (!isAccountType(lines[i])) continue;
     const type = lines[i];
@@ -136,16 +190,10 @@ function parseTradelines(text) {
     const accountStatus = nextValueInBlock(block, ['Account Status']);
     const rating = nextValueInBlock(block, ['Account Rating']);
     const balance = nextValueInBlock(block, ['Balance Owed', 'Current Balance', 'Balance', 'High Balance']);
+    const creditLimit = nextValueInBlock(block, ['Credit Limit', 'Credit Line', 'Limit']);
+    const monthlyPayment = nextValueInBlock(block, ['Monthly Payment', 'Payment Amount']);
     const bureaus = BUREAUS.filter((b) => new RegExp(b, 'i').test(joined)).join(', ');
-    accounts.push({
-      id: accounts.length + 1,
-      creditor,
-      type,
-      status: clean(paymentStatus || accountStatus || rating || type),
-      balance,
-      bureaus,
-      raw: joined
-    });
+    accounts.push({ id: accounts.length + 1, creditor, type, status: clean(paymentStatus || accountStatus || rating || type), paymentStatus, balance, creditLimit, monthlyPayment, bureaus, raw: joined });
     i = nextTypeIndex - 1;
   }
   return accounts;
@@ -187,7 +235,15 @@ const isVerifiedItem = (item) => Boolean(clean(item?.creditor) || clean(item?.ty
 const isCollection = (item) => /collection/i.test(itemText(item));
 const isChargeOff = (item) => /charge.?off|\bco\b/i.test(itemText(item));
 const hasRecentLate = (item) => /late payment|\b(?:30|60|90)\s*(?:days?\s*)?late\b|past due|delinquent|days late/i.test(itemText(item));
-const hasHighUtilization = (item) => /utilization|over limit|maxed|high\s*(?:balance|utilization)|credit\s*limit/i.test(`${item.status} ${item.raw || ''}`);
+const moneyNumber = (value) => {
+  const first = moneyOrNumber(value)[0];
+  return first ? Number(first.replace(/[$,]/g, '')) : null;
+};
+const hasHighUtilization = (item) => {
+  const balance = moneyNumber(item?.balance);
+  const limit = moneyNumber(item?.creditLimit);
+  return Number.isFinite(balance) && Number.isFinite(limit) && limit > 0 && (balance / limit) >= 0.7;
+};
 const verifiedCount = (value) => {
   const count = confirmedNumber(value);
   return count !== null && count > 0;
@@ -195,8 +251,8 @@ const verifiedCount = (value) => {
 const hasPublicRecords = (data) => verifiedCount(data.accountSummary.publicRecords);
 const hasInquiries = (data) => verifiedCount(data.accountSummary.inquiries);
 const hasThinFile = (data) => data.tradelines.length > 0 && data.positiveItems.length < 2;
-const NEGATIVE_LANGUAGE = /collection|charge.?off|late payment|\b(?:30|60|90|120|150)\s*(?:days?\s*)?late\b|derogatory|delinquent|repo(?:ssession)?|foreclosure|bankruptcy|settlement|past due|closed by grantor|negative status|days late|\bco\b/i;
-const POSITIVE_LANGUAGE = /open|current|paid as agreed|pays as agreed|never late|paid|satisfactory|ok|age|payment history|credit mix|utilization|available credit|credit limit/i;
+const NEGATIVE_LANGUAGE = /collection|charge.?off|late payment|\b(?:30|60|90|120|150)\s*(?:days?\s*)?late\b|derogatory|delinquent|\brepo(?:ssession)?\b|foreclosure|bankruptcy|settlement|past due|closed by grantor|negative status|days late|\bco\b/i;
+const POSITIVE_LANGUAGE = /open|current|paid as agreed|pays as agreed|never late|satisfactory|\bok\b/i;
 
 function cloneData(source) {
   return typeof structuredClone === 'function' ? structuredClone(source) : JSON.parse(JSON.stringify(source));
@@ -217,13 +273,13 @@ function classifyNegative(item) {
   return NEGATIVE_LANGUAGE.test(itemText(item));
 }
 function classifyPositive(item) {
-  return POSITIVE_LANGUAGE.test(itemText(item));
+  return !isCollection(item) && !isChargeOff(item) && POSITIVE_LANGUAGE.test(itemText(item));
 }
 function buildApprovedAnalysis(current) {
   const source = cloneData(current || emptyAnalysis());
   const tradelines = ensureList(source.tradelines);
-  const negativeItems = uniqueItems(ensureList(source.negativeItems));
-  const positiveItems = uniqueItems(ensureList(source.positiveItems));
+  const negativeItems = uniqueItems([...ensureList(source.negativeItems), ...tradelines.filter(classifyNegative)]);
+  const positiveItems = uniqueItems([...ensureList(source.positiveItems), ...tradelines.filter(classifyPositive)]);
   const collections = uniqueItems([...ensureList(source.collections), ...negativeItems.filter(isCollection), ...tradelines.filter(isCollection)]);
   const derogatoryItems = uniqueItems([...ensureList(source.derogatoryItems), ...negativeItems.filter(classifyNegative), ...tradelines.filter(classifyNegative)]);
   return {
@@ -417,7 +473,7 @@ function input(value, oninput, placeholder = '') { const node = el('input', { va
 function checkbox(label, checked, onchange) { const node = el('input', { type: 'checkbox' }); node.checked = Boolean(checked); node.addEventListener('change', (e) => onchange(e.target.checked)); return el('label', { class: 'check' }, [node, document.createTextNode(label)]); }
 function render() { const root = document.getElementById('root'); root.innerHTML = ''; root.append(el('main', {}, [el('section', { class: 'hero' }, [el('p', { class: 'eyebrow', text: 'Synergy4Life' }), el('h1', { text: 'Credit File Analyzer' }), el('p', { text: 'Paste copied report text, verify extracted fields, then approve a strategic credit game plan. Stage 1 supports pasted text only.' })]), pasteCard(), verificationCard(), strategyCard()])); }
 function pasteCard() { const area = el('textarea', { placeholder: 'Paste IdentityIQ, Credit Hero, SmartCredit, or unknown provider report text here...' }); area.value = rawText; area.addEventListener('input', (e) => rawText = e.target.value); const button = el('button', { text: 'Analyze Credit File', onclick: () => { analysis = parseReport(rawText); approvedAnalysis = null; approved = false; render(); } }); if (!rawText.trim()) button.disabled = true; return el('section', { class: 'card' }, [el('h2', { text: '1. Paste Credit Report Text' }), area, button]); }
-function verificationCard() { const grid = el('div', { class: 'grid' }); [['clientProfile', analysis.clientProfile], ['scores', analysis.scores], ['accountSummary', analysis.accountSummary]].forEach(([section, obj]) => Object.entries(obj).forEach(([key, value]) => grid.append(el('label', {}, [document.createTextNode(labelText(key)), input(value, (v) => { analysis[section][key] = v; approved = false; approvedAnalysis = null; })])))); return el('section', { class: 'card' }, [el('h2', { text: '2. Manual Verification' }), el('p', { class: 'notice', text: 'Review and edit organized data. Strategy stays locked until you click Approve Credit File Analysis. One tradeline can be positive overall while still having negative reporting flags.' }), grid, addTradelineForm(), listEditor('Tradelines', 'tradelines'), listEditor('Positive Items', 'positiveItems'), listEditor('Negative Reporting Flags', 'negativeItems'), listEditor('Collections', 'collections'), listEditor('Derogatory Flags', 'derogatoryItems'), textListEditor('Bureau Differences', 'bureauDifferences'), textListEditor('Rebuild Needs', 'rebuildNeeds'), el('button', { class: 'approve', text: 'Approve Credit File Analysis', onclick: () => { approvedAnalysis = buildApprovedAnalysis(analysis); approved = true; render(); } })]); }
+function verificationCard() { const grid = el('div', { class: 'grid' }); [['clientProfile', analysis.clientProfile], ['scores', analysis.scores], ['accountSummary', analysis.accountSummary]].forEach(([section, obj]) => Object.entries(obj).forEach(([key, value]) => grid.append(el('label', {}, [document.createTextNode(labelText(key)), input(value, (v) => { analysis[section][key] = v; approved = false; approvedAnalysis = null; })])))); return el('section', { class: 'card' }, [el('h2', { text: '2. Manual Verification' }), el('p', { class: 'notice', text: 'Review and edit organized data. Strategy stays locked until you click Approve Credit File Analysis. One tradeline can be positive overall while still having negative reporting flags.' }), grid, listEditor('Tradelines', 'tradelines'), listEditor('Positive Items', 'positiveItems'), listEditor('Negative Reporting Flags', 'negativeItems'), listEditor('Collections', 'collections'), listEditor('Derogatory Flags', 'derogatoryItems'), textListEditor('Bureau Differences', 'bureauDifferences'), textListEditor('Rebuild Needs', 'rebuildNeeds'), el('button', { class: 'approve', text: 'Approve Credit File Analysis', onclick: () => { approvedAnalysis = buildApprovedAnalysis(analysis); approved = true; render(); } })]); }
 function touchAnalysis() { approved = false; approvedAnalysis = null; }
 function cloneAccount(row = {}) { return { id: Date.now() + Math.random(), creditor: row.creditor || '', type: row.type || '', balance: row.balance || '', creditLimit: row.creditLimit || '', monthlyPayment: row.monthlyPayment || '', status: row.status || '', bureaus: row.bureaus || '', notes: row.notes || '', raw: row.raw || '' }; }
 function sameAccount(a, b) { return clean(`${a.creditor}|${a.type}|${a.balance}|${a.status}|${a.raw}`).toLowerCase() === clean(`${b.creditor}|${b.type}|${b.balance}|${b.status}|${b.raw}`).toLowerCase(); }
@@ -433,10 +489,8 @@ function accountControls(key, row, index) { return el('div', { class: 'controls'
   el('button', { class: 'secondary small', text: 'Delete Account', onclick: () => deleteAccount(key, index, row) }),
   el('button', { class: 'secondary small', text: 'Mark as Positive', onclick: () => markAccount(row, 'positive') }),
   el('button', { class: 'secondary small', text: 'Mark as Negative', onclick: () => markAccount(row, 'negative') }),
-  el('button', { class: 'secondary small', text: 'Mark as Both Positive and Negative', onclick: () => markAccount(row, 'both') }),
-  el('button', { class: 'secondary small', text: 'Add Missing Tradeline', onclick: () => { analysis.tradelines.push(cloneAccount()); touchAnalysis(); render(); } })
+  el('button', { class: 'secondary small', text: 'Mark as Both Positive and Negative', onclick: () => markAccount(row, 'both') })
 ]); }
-function addTradelineForm() { const draft = { creditor: '', type: '', balance: '', creditLimit: '', monthlyPayment: '', status: '', bureaus: '', isPositive: false, isNegative: false, notes: '' }; const box = el('div', { class: 'subcard' }, [el('h3', { text: 'Add Missing Tradeline' })]); box.append(accountFields(draft, (k, v) => draft[k] = v)); box.append(el('div', { class: 'checks' }, [checkbox('TransUnion', false, (v) => updateBureauDraft(draft, 'TransUnion', v)), checkbox('Experian', false, (v) => updateBureauDraft(draft, 'Experian', v)), checkbox('Equifax', false, (v) => updateBureauDraft(draft, 'Equifax', v)), checkbox('Is positive?', false, (v) => draft.isPositive = v), checkbox('Is negative?', false, (v) => draft.isNegative = v)])); box.append(el('button', { class: 'secondary', text: 'Add Missing Tradeline', onclick: () => { const item = cloneAccount(draft); item.bureaus = draft.bureaus; analysis.tradelines.push(item); if (draft.isPositive) addUniqueAccount('positiveItems', item); if (draft.isNegative) addUniqueAccount('negativeItems', item); touchAnalysis(); render(); } })); return box; }
 function updateBureauDraft(draft, bureau, checked) { const set = new Set((draft.bureaus || '').split(',').map(clean).filter(Boolean)); if (checked) set.add(bureau); else set.delete(bureau); draft.bureaus = [...set].join(', '); }
 function listEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} organized yet.` })); analysis[key].forEach((row, i) => { const editor = el('div', { class: 'account-editor collapsed', id: `${key}-${i}` }, [accountFields(row, (fieldName, value) => { analysis[key][i][fieldName] = value; touchAnalysis(); })]); box.append(el('div', { class: 'account-card' }, [el('strong', { text: row.creditor || 'Account needs creditor name' }), el('p', { class: 'muted', text: `${displayValue(row.type)} • ${displayValue(row.status)} • Balance: ${formatMoney(row.balance)}` }), accountControls(key, row, i), editor])); }); return box; }
 function textListEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} organized yet.` })); analysis[key].forEach((row, i) => box.append(input(row, (v) => { analysis[key][i] = v; touchAnalysis(); }))); return box; }
@@ -462,33 +516,15 @@ function strategyCard() {
     ])
   ]));
   box.append(strategySection('Positive Credit Profile', strategy.positiveItems.length ? strategy.positiveItems.map((item) => itemCard(item.creditor || 'Positive account', [
-    ['Creditor', displayValue(item.creditor)], ['Account type', displayValue(item.type)], ['Balance', formatMoney(item.balance)], ['Status', displayValue(item.status)], ['Role in strategy', item.role]
+    ['Creditor', displayValue(item.creditor)], ['Account Type', displayValue(item.type)], ['Balance', formatMoney(item.balance)], ['Credit Limit', formatMoney(item.creditLimit)], ['Status', displayValue(item.status || item.paymentStatus)], ['Role in Strategy', item.role]
   ])) : [emptyState('Some positive profile details still need manual confirmation before final rebuild targeting.')]));
-  box.append(strategySection('Negative Reporting Flag Attack Plan', strategy.negativeItems.length ? strategy.negativeItems.map((item) => itemCard(item.creditor || 'Negative account', [
-    ['Creditor', displayValue(item.creditor)], ['Account type', displayValue(item.type)], ['Balance', formatMoney(item.balance)], ['Status', displayValue(item.status)], ['Why it hurts', item.whyItHurts], ['Dispute priority', item.disputePriority]
-  ], [el('div', { class: 'angles' }, [el('span', { text: 'Factual attack angles' }), el('ul', {}, item.attackAngles.map((angle) => el('li', { text: angle })))])])) : [emptyState('Some items still need manual confirmation before final dispute targeting.')]));
+  box.append(strategySection('Negative Account Attack Plan', strategy.negativeItems.length ? strategy.negativeItems.map((item) => itemCard(item.creditor || 'Negative account', [
+    ['Creditor', displayValue(item.creditor)], ['Account Type', displayValue(item.type)], ['Balance', formatMoney(item.balance)], ['Status', displayValue(item.status || item.paymentStatus)], ['Why It Hurts', item.whyItHurts], ['Dispute Priority', item.disputePriority]
+  ], [el('div', { class: 'angles' }, [el('span', { text: 'Factual Attack Angles' }), el('ul', {}, item.attackAngles.map((angle) => el('li', { text: angle })))])])) : [emptyState('Some items still need manual confirmation before final dispute targeting.')]));
   box.append(strategySection('Score Blocker Ranking', strategy.scoreBlockers.length ? [el('div', { class: 'rank-list' }, strategy.scoreBlockers.map((blocker, index) => el('article', { class: 'rank-card' }, [el('strong', { text: `${index + 1}. ${blocker.title}` }), el('p', { text: blocker.detail })])))] : [emptyState('Some items still need manual confirmation before final dispute targeting.')]));
   box.append(strategySection('30/60/90 Game Plan', Object.entries(strategy.gamePlan).map(([period, steps]) => el('article', { class: 'plan-card' }, [el('h4', { text: period }), el('ul', {}, steps.map((step) => el('li', { text: step }))) ]))));
   box.append(strategySection('Client Update Message', [el('div', { class: 'client-message', text: strategy.clientUpdateMessage }), copyButton('Copy Client Update Message', () => strategy.clientUpdateMessage)]));
-  box.append(strategySection('Copy Strategy Outputs', [
-    copyButton('Copy Dispute Hit List', () => disputeHitListText(strategy)),
-    copyButton('Copy Rebuild Plan', () => rebuildPlanText(strategy)),
-    copyButton('Copy 30/60/90 Plan', () => planText(strategy)),
-    copyButton('Copy Full Strategy Summary', () => strategySummaryText(strategy))
-  ]));
-  box.append(strategySection('Approved Data Check', [
-    el('details', { class: 'approved-data-check' }, [
-      el('summary', { text: 'Approved Data Check' }),
-      el('div', { class: 'snapshot-grid' }, [
-        field('Client name used', strategy.debug.clientName),
-        field('Report date used', strategy.debug.reportDate),
-        field('Scores used', strategy.debug.scores),
-        field('Tradelines used', strategy.debug.tradelines),
-        field('Positive items used', strategy.debug.positiveItems),
-        field('Negative items used', strategy.debug.negativeItems)
-      ])
-    ])
-  ]));
+  box.append(copyButton('Copy Strategy Summary', () => strategySummaryText(strategy)));
   return box;
 }
 render();
