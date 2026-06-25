@@ -166,14 +166,83 @@ function parseReport(text) {
     rebuildNeeds: []
   };
 }
+const firstValue = (value) => clean(String(value || '').split('|')[0].replace(/^(TU|EX|EQ)\s*/i, ''));
+const parsedCount = (value) => {
+  const numbers = moneyOrNumber(value);
+  return numbers.length ? numbers[0] : '';
+};
+const displayValue = (value, fallback = 'Not verified') => clean(value) || fallback;
+const formatMoney = (value) => displayValue(value);
+const scoreValue = (data, bureau) => displayValue(data.scores[bureau]);
+const isCollection = (item) => /collection/i.test(`${item.type} ${item.status} ${item.raw || ''}`);
+const isChargeOff = (item) => /charge.?off|\bco\b/i.test(`${item.status} ${item.raw || ''}`);
+const hasRecentLate = (item) => /\b(30|60|90|120|150)\b|late|past due|delinquent/i.test(`${item.status} ${item.raw || ''}`);
+const hasHighUtilization = (item) => /utilization|over limit|maxed/i.test(`${item.status} ${item.raw || ''}`);
+const verifiedCount = (value) => {
+  const count = Number(parsedCount(value));
+  return Number.isFinite(count) && count > 0;
+};
+const hasPublicRecords = (data) => verifiedCount(data.accountSummary.publicRecords);
+const hasInquiries = (data) => verifiedCount(data.accountSummary.inquiries);
+const hasThinFile = (data) => data.tradelines.length > 0 && data.positiveItems.length < 2;
+function attackAngles(item) {
+  const base = isCollection(item)
+    ? ['Verify ownership.', 'Verify original creditor.', 'Verify balance.', 'Verify dates.', 'Verify collection authority.', 'Verify account status.', 'Verify bureau-level reporting accuracy.']
+    : ['Verify account ownership.', 'Verify balance and past-due amount.', 'Verify date opened, date reported, and last activity.', 'Verify account status and payment status.', 'Verify bureau-level reporting accuracy.'];
+  return base;
+}
+function whyItHurts(item) {
+  if (isCollection(item)) return 'Collection reporting can suppress scores and trigger lender conditions until ownership, balance, dates, authority, and reporting accuracy are verified.';
+  if (isChargeOff(item)) return 'Charge-off reporting signals severe delinquency and can weigh heavily on payment history and lender risk review.';
+  if (hasRecentLate(item)) return 'Late-payment reporting directly affects payment history and can be a major recent score blocker.';
+  return 'This negative tradeline may be hurting payment history, derogatory status, utilization, or lender approval review.';
+}
+function disputePriority(item) {
+  if (hasRecentLate(item)) return 'High — recent late-payment accuracy review.';
+  if (isCollection(item)) return 'High — collection validation and bureau reporting review.';
+  if (isChargeOff(item)) return 'High — charge-off status, balance, and date accuracy review.';
+  return 'Medium — factual tradeline accuracy review.';
+}
+function scoreBlockerRanking(data) {
+  const ranked = [];
+  const recentLates = data.negativeItems.filter(hasRecentLate);
+  if (recentLates.length) ranked.push({ title: 'Recent late payments', detail: `${recentLates.length} verified negative item(s) show late-payment or delinquency language.` });
+  const collections = data.negativeItems.filter(isCollection);
+  const summaryCollections = firstValue(data.accountSummary.collections);
+  if (collections.length || verifiedCount(data.accountSummary.collections)) ranked.push({ title: 'Collections', detail: collections.length ? `${collections.length} collection tradeline(s) parsed.` : `Summary reports collections: ${summaryCollections}.` });
+  const chargeOffs = data.negativeItems.filter(isChargeOff);
+  if (chargeOffs.length) ranked.push({ title: 'Charge-offs', detail: `${chargeOffs.length} charge-off item(s) parsed.` });
+  const highUtil = data.tradelines.filter(hasHighUtilization);
+  if (highUtil.length) ranked.push({ title: 'High utilization', detail: `${highUtil.length} parsed tradeline(s) include high-utilization language.` });
+  if (hasPublicRecords(data)) ranked.push({ title: 'Public records', detail: `Summary reports public records: ${firstValue(data.accountSummary.publicRecords)}.` });
+  if (hasInquiries(data)) ranked.push({ title: 'Inquiries', detail: `Summary reports inquiries: ${firstValue(data.accountSummary.inquiries)}.` });
+  if (hasThinFile(data)) ranked.push({ title: 'Thin file / missing positives', detail: `${data.positiveItems.length} positive tradeline(s) parsed across ${data.tradelines.length} total tradeline(s).` });
+  return ranked;
+}
 function makeStrategy(data) {
-  const blockers = [];
-  if (data.negativeItems.length) blockers.push(`${data.negativeItems.length} verified negative tradeline(s) need factual review.`);
-  if (data.accountSummary.collections) blockers.push(`Collections reported in summary: ${data.accountSummary.collections}.`);
-  if (data.accountSummary.derogatoryAccounts) blockers.push(`Derogatory accounts reported in summary: ${data.accountSummary.derogatoryAccounts}.`);
-  if (!blockers.length) blockers.push('No specific score blockers were verified from the pasted text. Review manually before advising the client.');
-  const disputes = data.negativeItems.map((item) => `${item.creditor}: verify balance, dates, status, ownership, payment history, and bureau-level reporting.`);
-  return { fileSummary: `${data.clientProfile.clientName || 'Client'} file parsed from ${data.clientProfile.provider}. Scores captured: ${BUREAUS.filter((b) => data.scores[b]).join(', ') || 'none verified'}. Tradelines captured: ${data.tradelines.length}.`, biggestScoreBlockers: blockers, disputePriorities: disputes.length ? disputes : ['No account-level dispute priority can be created until a negative tradeline is verified.'], factualDisputeAngles: ['Verify account ownership.', 'Verify current balance and past-due amount.', 'Verify open/closed status and date fields.', 'Verify payment history and derogatory notation accuracy.'], bureauInconsistencyAngles: data.bureauDifferences.length ? data.bureauDifferences : ['No bureau inconsistency was verified from the pasted text.'], rebuildStrategy: ['Protect every open positive account with on-time payments.', 'Keep revolving utilization low if revolving balances are present.', 'Add positive credit only after verified negatives and utilization risks are understood.'], mortgageReadinessNotes: ['Do not add new debt before lender review.', 'Resolve or document verified collections/public records before pre-approval.', 'Maintain clean 30/60/90-day payment history.'], thirtyDayPlan: ['Complete verification edits.', 'Prioritize verified negative items.', 'Prepare factual dispute letters from verified inaccuracies.'], sixtyDayPlan: ['Review bureau responses.', 'Update utilization and payment status.', 'Escalate unresolved factual inaccuracies.'], ninetyDayPlan: ['Re-pull and compare bureau changes.', 'Confirm score movement and remaining blockers.', 'Prepare lender-readiness checklist if mortgage-bound.'], clientUpdateMessage: 'Your pasted credit report has been reviewed and organized. We will focus first on verified score blockers, bureau inconsistencies, and rebuild steps that support your 30/60/90-day plan.' };
+  return {
+    snapshot: {
+      clientName: displayValue(data.clientProfile.clientName),
+      provider: displayValue(data.clientProfile.provider),
+      reportDate: displayValue(data.clientProfile.reportDate),
+      scores: { TU: scoreValue(data, 'TransUnion'), EX: scoreValue(data, 'Experian'), EQ: scoreValue(data, 'Equifax') },
+      totalTradelines: data.tradelines.length,
+      positiveTradelines: data.positiveItems.length,
+      negativeTradelines: data.negativeItems.length,
+      collections: parsedCount(data.accountSummary.collections) || data.negativeItems.filter(isCollection).length,
+      derogatory: parsedCount(data.accountSummary.derogatoryAccounts) || data.negativeItems.length,
+      inquiries: parsedCount(data.accountSummary.inquiries) || 'Not verified'
+    },
+    positiveItems: data.positiveItems.map((item) => ({ ...item, role: 'Protect this account. This helps age, payment history, and positive revolving profile.' })),
+    negativeItems: data.negativeItems.map((item) => ({ ...item, whyItHurts: whyItHurts(item), disputePriority: disputePriority(item), attackAngles: attackAngles(item) })),
+    scoreBlockers: scoreBlockerRanking(data),
+    gamePlan: {
+      '30 Days': ['Verify parsed data against the report before sending anything.', 'Send factual disputes for verified negative items only.', 'Protect positive accounts with on-time payments and no unnecessary new debt.', 'Give the client rebuild instructions based on verified positives, negatives, and utilization risk.'],
+      '60 Days': ['Review bureau responses and document each result.', 'Compare deleted, verified, updated, or stalled accounts by bureau.', 'Prepare second-round escalation for unresolved factual inaccuracies.'],
+      '90 Days': ['Re-pull the report and compare against the approved baseline.', 'Update score blockers using only newly verified data.', 'Complete mortgage/rebuild readiness review.', 'Decide the next dispute or rebuild move.']
+    },
+    clientUpdateMessage: `Hi ${data.clientProfile.clientName || 'there'}, your credit file review is organized. We verified the parsed report details, identified the items that may be affecting your score, and built a 30/60/90-day plan. Next, we will focus only on verified negative reporting, protect your positive accounts, review bureau responses, and update your rebuild or mortgage-readiness steps as the file changes.`
+  };
 }
 const el = (tag, attrs = {}, children = []) => { const node = document.createElement(tag); Object.entries(attrs).forEach(([k, v]) => { if (k === 'class') node.className = v; else if (k === 'text') node.textContent = v; else if (k.startsWith('on')) node.addEventListener(k.slice(2), v); else node.setAttribute(k, v); }); children.forEach((c) => node.append(c)); return node; };
 function input(value, oninput, placeholder = '') { const node = el('input', { value, placeholder }); node.addEventListener('input', (e) => oninput(e.target.value)); return node; }
@@ -182,5 +251,35 @@ function pasteCard() { const area = el('textarea', { placeholder: 'Paste Identit
 function verificationCard() { const grid = el('div', { class: 'grid' }); [['clientProfile', analysis.clientProfile], ['scores', analysis.scores], ['accountSummary', analysis.accountSummary]].forEach(([section, obj]) => Object.entries(obj).forEach(([key, value]) => grid.append(el('label', {}, [document.createTextNode(labelText(key)), input(value, (v) => { analysis[section][key] = v; })])))); return el('section', { class: 'card' }, [el('h2', { text: '2. Manual Verification' }), el('p', { class: 'notice', text: 'Review and edit parsed data. Strategy stays locked until approval.' }), grid, listEditor('Tradelines', 'tradelines'), listEditor('Positive Items', 'positiveItems'), listEditor('Negative Items', 'negativeItems'), textListEditor('Bureau Differences', 'bureauDifferences'), el('button', { class: 'approve', text: 'Approve Credit File Analysis', onclick: () => { approved = true; render(); } })]); }
 function listEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} parsed.` })); analysis[key].forEach((row, i) => box.append(el('div', { class: 'row' }, [input(row.creditor || '', (v) => analysis[key][i].creditor = v, 'creditor'), input(row.type || '', (v) => analysis[key][i].type = v, 'type'), input(row.balance || '', (v) => analysis[key][i].balance = v, 'balance'), input(row.status || '', (v) => analysis[key][i].status = v, 'status')]))); return box; }
 function textListEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} parsed.` })); analysis[key].forEach((row, i) => box.append(input(row, (v) => analysis[key][i] = v))); return box; }
-function strategyCard() { const box = el('section', { class: `card ${approved ? '' : 'locked'}` }, [el('h2', { text: '3. Strategy & 30/60/90 Game Plan' })]); if (!approved) box.append(el('p', { class: 'notice', text: 'Approve the verified credit file analysis to generate strategy.' })); else { const strategy = makeStrategy(analysis); box.append(el('p', { text: strategy.fileSummary })); Object.entries(strategy).filter(([k]) => k !== 'fileSummary').forEach(([k, v]) => { const part = el('div', {}, [el('h3', { text: labelText(k) })]); if (Array.isArray(v)) part.append(el('ul', {}, v.map((x) => el('li', { text: x })))); else part.append(el('p', { text: v })); box.append(part); }); } return box; }
+function field(label, value) { return el('div', { class: 'metric' }, [el('span', { text: label }), el('strong', { text: String(value) })]); }
+function itemCard(title, rows, extra = []) { return el('article', { class: 'strategy-item' }, [el('h4', { text: title }), ...rows.map(([label, value]) => field(label, value)), ...extra]); }
+function emptyState(text) { return el('p', { class: 'muted empty', text }); }
+function strategySection(title, children) { return el('div', { class: 'strategy-section' }, [el('h3', { text: title }), ...children]); }
+function strategyCard() {
+  const box = el('section', { class: `card strategy ${approved ? '' : 'locked'}` }, [el('h2', { text: '3. Strategy & 30/60/90 Game Plan' })]);
+  if (!approved) {
+    box.append(el('p', { class: 'notice', text: 'Approve the verified credit file analysis to generate strategy.' }));
+    return box;
+  }
+  const strategy = makeStrategy(analysis);
+  const snap = strategy.snapshot;
+  box.append(strategySection('Credit File Snapshot', [
+    el('div', { class: 'snapshot-grid' }, [
+      field('Client name', snap.clientName), field('Provider', snap.provider), field('Report date', snap.reportDate),
+      field('TU score', snap.scores.TU), field('EX score', snap.scores.EX), field('EQ score', snap.scores.EQ),
+      field('Total tradelines parsed', snap.totalTradelines), field('Positive tradelines', snap.positiveTradelines), field('Negative tradelines', snap.negativeTradelines),
+      field('Collections', snap.collections), field('Derogatory', snap.derogatory), field('Inquiries', snap.inquiries)
+    ])
+  ]));
+  box.append(strategySection('Positive Credit Profile', strategy.positiveItems.length ? strategy.positiveItems.map((item) => itemCard(item.creditor || 'Positive account', [
+    ['Creditor', displayValue(item.creditor)], ['Account type', displayValue(item.type)], ['Balance', formatMoney(item.balance)], ['Status', displayValue(item.status)], ['Role in strategy', item.role]
+  ])) : [emptyState('No positive tradelines were parsed or manually entered.')]));
+  box.append(strategySection('Negative Account Attack Plan', strategy.negativeItems.length ? strategy.negativeItems.map((item) => itemCard(item.creditor || 'Negative account', [
+    ['Creditor', displayValue(item.creditor)], ['Account type', displayValue(item.type)], ['Balance', formatMoney(item.balance)], ['Status', displayValue(item.status)], ['Why it hurts', item.whyItHurts], ['Dispute priority', item.disputePriority]
+  ], [el('div', { class: 'angles' }, [el('span', { text: 'Factual attack angles' }), el('ul', {}, item.attackAngles.map((angle) => el('li', { text: angle })))])])) : [emptyState('No negative tradelines were parsed or manually entered.')]));
+  box.append(strategySection('Score Blocker Ranking', strategy.scoreBlockers.length ? [el('div', { class: 'rank-list' }, strategy.scoreBlockers.map((blocker, index) => el('article', { class: 'rank-card' }, [el('strong', { text: `${index + 1}. ${blocker.title}` }), el('p', { text: blocker.detail })])))] : [emptyState('No score blockers were verified from the parsed or manually entered data.')]));
+  box.append(strategySection('30/60/90 Game Plan', Object.entries(strategy.gamePlan).map(([period, steps]) => el('article', { class: 'plan-card' }, [el('h4', { text: period }), el('ul', {}, steps.map((step) => el('li', { text: step }))) ]))));
+  box.append(strategySection('Client Update Message', [el('div', { class: 'client-message', text: strategy.clientUpdateMessage })]));
+  return box;
+}
 render();
