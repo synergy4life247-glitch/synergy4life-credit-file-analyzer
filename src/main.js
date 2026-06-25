@@ -222,12 +222,8 @@ function classifyPositive(item) {
 function buildApprovedAnalysis(current) {
   const source = cloneData(current || emptyAnalysis());
   const tradelines = ensureList(source.tradelines);
-  const manualPositive = ensureList(source.positiveItems);
-  const manualNegative = ensureList(source.negativeItems);
-  const derivedNegative = tradelines.filter(classifyNegative);
-  const derivedPositive = tradelines.filter(classifyPositive);
-  const negativeItems = uniqueItems([...manualNegative, ...derivedNegative]);
-  const positiveItems = uniqueItems([...manualPositive, ...derivedPositive]);
+  const negativeItems = uniqueItems(ensureList(source.negativeItems));
+  const positiveItems = uniqueItems(ensureList(source.positiveItems));
   const collections = uniqueItems([...ensureList(source.collections), ...negativeItems.filter(isCollection), ...tradelines.filter(isCollection)]);
   const derogatoryItems = uniqueItems([...ensureList(source.derogatoryItems), ...negativeItems.filter(classifyNegative), ...tradelines.filter(classifyNegative)]);
   return {
@@ -314,11 +310,13 @@ function makeStrategy(sourceData) {
   const summaryCollections = confirmedNumber(data.accountSummary.collections);
   const summaryDerogatory = confirmedNumber(data.accountSummary.derogatoryAccounts);
   const summaryInquiries = confirmedNumber(data.accountSummary.inquiries);
+  const summaryTotalAccounts = confirmedNumber(data.accountSummary.totalAccounts);
+  const summaryDelinquent = confirmedNumber(data.accountSummary.delinquentAccounts);
   const hasApprovedTradelineData = Boolean((data.tradelines || []).length || (data.positiveItems || []).length || (data.negativeItems || []).length || approvedCollections.length || approvedDerogatory.length);
   const totalTradelineCount = (data.tradelines || []).length || uniqueItems([...(data.positiveItems || []), ...(data.negativeItems || [])]).length;
-  const totalTradelines = hasApprovedTradelineData ? totalTradelineCount : null;
+  const totalTradelines = hasApprovedTradelineData ? totalTradelineCount : summaryTotalAccounts;
   const positiveCount = (data.positiveItems || []).length ? data.positiveItems.length : null;
-  const negativeCount = (data.negativeItems || []).length ? data.negativeItems.length : null;
+  const negativeCount = (data.negativeItems || []).length ? data.negativeItems.length : (summaryDerogatory ?? summaryDelinquent);
   const collectionCount = approvedCollections.length ? approvedCollections.length : summaryCollections;
   const derogatoryCount = approvedDerogatory.length ? approvedDerogatory.length : summaryDerogatory;
   const valueOrNeeds = (value) => displayValue(value, 'Needs verification');
