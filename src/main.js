@@ -18,7 +18,8 @@ const REPORT_LABELS = new Set([
   'account type','payment frequency','credit limit','two-year payment history','days late - 7 year history','back to top','unknown','ok','current',
   '30','60','90','120','150','pp','rf','co','transunion','experian','equifax','type','status','date filed/reported','reference#','closing date',
   'asset amount','court','liability','exempt amount','remarks','creditor name','address','phone number','name','also known as','former','date of birth',
-  'current address','previous address(es)','employers','vantage score® 3.0','vantage score 3.0'
+  'current address','previous address(es)','employers','vantage score® 3.0','vantage score 3.0','original creditor','original creditor:',
+  'bank credit cards','other collection agencies','loan company','finance company','credit card','medical/health care','utility company'
 ]);
 const ACCOUNT_TYPES = ['Installment', 'Revolving', 'Collection', 'Open Account', 'Mortgage', 'Auto Loan', 'Student Loan'];
 const emptyAnalysis = () => ({
@@ -93,7 +94,7 @@ function summaryValue(summary, labels) {
 }
 function parseScores(text) {
   const scores = { TransUnion: '', Experian: '', Equifax: '' };
-  const scoreSection = getSection(text, 'Credit Score', ['Personal Information', 'Account Summary']);
+  const scoreSection = getSection(text, 'Credit Score', ['Personal Information', 'Account Summary', 'Account History']);
   BUREAUS.forEach((bureau) => {
     const short = bureau === 'TransUnion' ? 'TU' : bureau === 'Experian' ? 'EX' : 'EQ';
     const match = (scoreSection || text).match(new RegExp(`(?:${bureau}|${short})\\s*[:#-]?\\s*([3-8]\\d{2})`, 'i'));
@@ -107,36 +108,45 @@ function isAccountType(line) { return ACCOUNT_TYPES.some((type) => new RegExp(`^
 function isCreditorCandidate(line) {
   const lower = line.toLowerCase();
   if (!line || REPORT_LABELS.has(lower) || isAccountType(line)) return false;
+  if (line.includes(':')) return false;
   if (/^(none reported|back to top|days late|ok\b|co\b|jan-|feb-|mar-|apr-|may-|jun-|jul-|aug-|sep-|oct-|nov-|dec-)/i.test(line)) return false;
   if (/^[\d\s$,.:-]+$/.test(line)) return false;
   if (/\b(accounts?|balances?|payments?|records?|inquiries?|delinquent|derogatory)\b/i.test(line) && /\d/.test(line)) return false;
-  return /[A-Za-z]{3,}/.test(line) && line.length <= 90;
+  return /[A-Za-z0-9]{2,}/.test(line) && line.length <= 90;
 }
 function nextValueInBlock(block, labels) { return valueAfterLabel(block.join('\n'), labels); }
+function findNextAccountType(lines, start) {
+  for (let i = start; i < lines.length; i++) if (isAccountType(lines[i])) return i;
+  return lines.length;
+}
 function parseTradelines(text) {
   const accountHistory = getSection(text, 'Account History', ['Inquiries', 'Public Information', 'Creditor Contacts']);
   if (!accountHistory) return [];
   const lines = linesOf(accountHistory).filter(line => !/^Account History$/i.test(line));
   const accounts = [];
-  let currentType = '';
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (isAccountType(line)) { currentType = line; continue; }
-    if (!isCreditorCandidate(line)) continue;
-    const block = [line];
-    for (let j = i + 1; j < lines.length; j++) {
-      if (isAccountType(lines[j]) || isCreditorCandidate(lines[j])) break;
-      block.push(lines[j]);
-    }
+    if (!isAccountType(lines[i])) continue;
+    const type = lines[i];
+    const nextTypeIndex = findNextAccountType(lines, i + 1);
+    const block = lines.slice(i, nextTypeIndex);
+    const creditor = block.slice(1).find(isCreditorCandidate) || '';
+    if (!creditor) { i = nextTypeIndex - 1; continue; }
     const joined = block.join('\n');
     const paymentStatus = nextValueInBlock(block, ['Payment Status']);
     const accountStatus = nextValueInBlock(block, ['Account Status']);
     const rating = nextValueInBlock(block, ['Account Rating']);
-    const status = clean(paymentStatus || accountStatus || rating || currentType);
-    const balance = nextValueInBlock(block, ['Balance Owed', 'Balance', 'High Balance']);
+    const balance = nextValueInBlock(block, ['Balance Owed', 'Current Balance', 'Balance', 'High Balance']);
     const bureaus = BUREAUS.filter((b) => new RegExp(b, 'i').test(joined)).join(', ');
-    accounts.push({ id: accounts.length + 1, creditor: line, type: currentType, status, balance, bureaus, raw: joined });
-    i += block.length - 1;
+    accounts.push({
+      id: accounts.length + 1,
+      creditor,
+      type,
+      status: clean(paymentStatus || accountStatus || rating || type),
+      balance,
+      bureaus,
+      raw: joined
+    });
+    i = nextTypeIndex - 1;
   }
   return accounts;
 }
@@ -148,7 +158,7 @@ function parseReport(text) {
   const negativeItems = tradelines.filter((t) => /charge.?off|collection|late|derogatory|delinquent|repossession|foreclosure/i.test(`${t.type} ${t.status} ${t.raw}`));
   const positiveItems = tradelines.filter((t) => /current|paid|open/i.test(`${t.status} ${t.raw}`) && !negativeItems.includes(t));
   const accountSummary = {};
-  SUMMARY_FIELDS.forEach(([key, labels]) => accountSummary[key] = summaryValue(summary || text, labels));
+  SUMMARY_FIELDS.forEach(([key, labels]) => accountSummary[key] = summary ? summaryValue(summary, labels) : '');
   return {
     clientProfile: { provider, clientName: valueAfterLabel(personal || text, ['Client Name', 'Consumer Name', 'Name']), reportDate: valueAfterLabel(text, ['Credit Report Date', 'Report Date', 'Date Pulled', 'Prepared For Date']) },
     scores: parseScores(text), accountSummary, tradelines, negativeItems, positiveItems,
@@ -169,8 +179,8 @@ const el = (tag, attrs = {}, children = []) => { const node = document.createEle
 function input(value, oninput, placeholder = '') { const node = el('input', { value, placeholder }); node.addEventListener('input', (e) => oninput(e.target.value)); return node; }
 function render() { const root = document.getElementById('root'); root.innerHTML = ''; root.append(el('main', {}, [el('section', { class: 'hero' }, [el('p', { class: 'eyebrow', text: 'Synergy4Life' }), el('h1', { text: 'Credit File Analyzer' }), el('p', { text: 'Paste copied report text, verify extracted fields, then approve a strategic credit game plan. Stage 1 supports pasted text only.' })]), pasteCard(), verificationCard(), strategyCard()])); }
 function pasteCard() { const area = el('textarea', { placeholder: 'Paste IdentityIQ, Credit Hero, SmartCredit, or unknown provider report text here...' }); area.value = rawText; area.addEventListener('input', (e) => rawText = e.target.value); const button = el('button', { text: 'Analyze Credit File', onclick: () => { analysis = parseReport(rawText); approved = false; render(); } }); if (!rawText.trim()) button.disabled = true; return el('section', { class: 'card' }, [el('h2', { text: '1. Paste Credit Report Text' }), area, button]); }
-function verificationCard() { const grid = el('div', { class: 'grid' }); [['clientProfile', analysis.clientProfile], ['scores', analysis.scores], ['accountSummary', analysis.accountSummary]].forEach(([section, obj]) => Object.entries(obj).forEach(([key, value]) => grid.append(el('label', {}, [document.createTextNode(labelText(key)), input(value, (v) => { analysis[section][key] = v; })])))); return el('section', { class: 'card' }, [el('h2', { text: '2. Manual Verification' }), el('p', { class: 'notice', text: 'Review and edit parsed data. Strategy stays locked until approval.' }), grid, listEditor('Tradelines', 'tradelines'), listEditor('Negative Items', 'negativeItems'), textListEditor('Bureau Differences', 'bureauDifferences'), el('button', { class: 'approve', text: 'Approve Credit File Analysis', onclick: () => { approved = true; render(); } })]); }
-function listEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} parsed.` })); analysis[key].forEach((row, i) => box.append(el('div', { class: 'row' }, [input(row.creditor || '', (v) => analysis[key][i].creditor = v, 'creditor'), input(row.status || '', (v) => analysis[key][i].status = v, 'status'), input(row.balance || '', (v) => analysis[key][i].balance = v, 'balance')]))); return box; }
+function verificationCard() { const grid = el('div', { class: 'grid' }); [['clientProfile', analysis.clientProfile], ['scores', analysis.scores], ['accountSummary', analysis.accountSummary]].forEach(([section, obj]) => Object.entries(obj).forEach(([key, value]) => grid.append(el('label', {}, [document.createTextNode(labelText(key)), input(value, (v) => { analysis[section][key] = v; })])))); return el('section', { class: 'card' }, [el('h2', { text: '2. Manual Verification' }), el('p', { class: 'notice', text: 'Review and edit parsed data. Strategy stays locked until approval.' }), grid, listEditor('Tradelines', 'tradelines'), listEditor('Positive Items', 'positiveItems'), listEditor('Negative Items', 'negativeItems'), textListEditor('Bureau Differences', 'bureauDifferences'), el('button', { class: 'approve', text: 'Approve Credit File Analysis', onclick: () => { approved = true; render(); } })]); }
+function listEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} parsed.` })); analysis[key].forEach((row, i) => box.append(el('div', { class: 'row' }, [input(row.creditor || '', (v) => analysis[key][i].creditor = v, 'creditor'), input(row.type || '', (v) => analysis[key][i].type = v, 'type'), input(row.balance || '', (v) => analysis[key][i].balance = v, 'balance'), input(row.status || '', (v) => analysis[key][i].status = v, 'status')]))); return box; }
 function textListEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} parsed.` })); analysis[key].forEach((row, i) => box.append(input(row, (v) => analysis[key][i] = v))); return box; }
 function strategyCard() { const box = el('section', { class: `card ${approved ? '' : 'locked'}` }, [el('h2', { text: '3. Strategy & 30/60/90 Game Plan' })]); if (!approved) box.append(el('p', { class: 'notice', text: 'Approve the verified credit file analysis to generate strategy.' })); else { const strategy = makeStrategy(analysis); box.append(el('p', { text: strategy.fileSummary })); Object.entries(strategy).filter(([k]) => k !== 'fileSummary').forEach(([k, v]) => { const part = el('div', {}, [el('h3', { text: labelText(k) })]); if (Array.isArray(v)) part.append(el('ul', {}, v.map((x) => el('li', { text: x })))); else part.append(el('p', { text: v })); box.append(part); }); } return box; }
 render();
