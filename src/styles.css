@@ -12,6 +12,7 @@ h4{margin:0 0 12px;font-size:1rem;color:#143d2f}
 textarea{width:100%;min-height:310px;border:1px solid #cbd8c9;border-radius:18px;padding:16px;font:inherit;resize:vertical;background:#fbfdfb}
 button{width:100%;border:0;border-radius:16px;background:#143d2f;color:white;padding:16px 18px;margin-top:14px;font-weight:800;font-size:1rem}
 button:disabled{background:#9bad9f}
+.secondary{background:#edf6ee;color:#143d2f;border:1px solid #cbd8c9}
 .approve{background:#d59a22;color:#1f1605}
 .grid{display:grid;grid-template-columns:1fr;gap:12px}
 label{display:flex;flex-direction:column;gap:6px;text-transform:capitalize;font-weight:700;color:#405148;font-size:.9rem}
