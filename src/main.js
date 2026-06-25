@@ -7,7 +7,7 @@ const SUMMARY_FIELDS = [
   ['derogatoryAccounts', ['Derogatory Accounts', 'Derogatory']],
   ['collections', ['Collections', 'Collection Accounts', 'Collection']],
   ['balances', ['Balances', 'Total Balance', 'Balance']],
-  ['payments', ['Payments', 'Monthly Payments', 'Payment']],
+  ['payments', ['Payments', 'Monthly Payments', 'Payment', 'Monthly Payment']],
   ['publicRecords', ['Public Records', 'Public Information']],
   ['inquiries', ['Inquiries', 'Credit Inquiries', 'Inquiries(2 years)']]
 ];
@@ -21,7 +21,7 @@ const REPORT_LABELS = new Set([
   'current address','previous address(es)','employers','vantage score® 3.0','vantage score 3.0','original creditor','original creditor:',
   'bank credit cards','other collection agencies','loan company','finance company','credit card','medical/health care','utility company'
 ]);
-const ACCOUNT_TYPES = ['Installment', 'Revolving', 'Collection', 'Open Account', 'Mortgage', 'Auto Loan', 'Student Loan'];
+const ACCOUNT_TYPES = ['Installment', 'Revolving', 'Collection', 'Open Account', 'Mortgage', 'Auto Loan', 'Student Loan', 'Credit Card'];
 const emptyAnalysis = () => ({
   clientProfile: { provider: 'Unknown', clientName: '', reportDate: '' },
   scores: { TransUnion: '', Experian: '', Equifax: '' },
@@ -36,7 +36,11 @@ const moneyOrNumber = (value) => String(value || '').match(/\$?\d[\d,]*(?:\.\d{2
 const formatBureauValues = (values) => values.length >= 3 ? `TU ${values[0]} | EX ${values[1]} | EQ ${values[2]}` : (values[0] || '');
 const labelText = (key) => key.replace(/([A-Z])/g, ' $1').replace(/^./, c => c.toUpperCase());
 function detectProvider(text) {
-  if (/identity\s*iq|identityiq|credit\s+report\s+date|transunion|experian|equifax|account\s+summary|credit\s+score/i.test(text)) return 'IdentityIQ';
+  const identityIqSignals = [
+    /credit\s+score/i, /personal\s+information/i, /account\s+summary/i, /account\s+name/i, /account\s+type/i,
+    /original\s+creditor/i, /\bbalance\b/i, /\bstatus\b/i, /payment\s+status/i, /bureau\s+reporting/i, /credit\s+report\s+date/i
+  ].filter((pattern) => pattern.test(text)).length;
+  if (/identity\s*iq|identityiq/i.test(text) || identityIqSignals >= 3) return 'IdentityIQ';
   if (/credit\s*hero/i.test(text)) return 'Credit Hero';
   if (/smart\s*credit|smartcredit/i.test(text)) return 'SmartCredit';
   return 'Unknown';
@@ -294,9 +298,9 @@ const verifiedCount = (value) => {
 const hasPublicRecords = (data) => verifiedCount(data.accountSummary.publicRecords);
 const hasInquiries = (data) => verifiedCount(data.accountSummary.inquiries);
 const hasThinFile = (data) => data.tradelines.length > 0 && data.positiveItems.length < 2;
-const NEGATIVE_LANGUAGE = /collection(?: account)?|charge.?off|transferred\/?charged off|late payment|\b(?:30|60|90|120|150)\s*(?:days?\s*)?late\b|derogatory|delinquent|\brepo(?:ssession)?\b|foreclosure|bankruptcy|settlement|past due|profit and loss|closed by grantor|negative status|days late|\bco\b/i;
-const POSITIVE_LANGUAGE = /open|current|paid as agreed|pays as agreed|never late|satisfactory|revolving|installment|\bok\b/i;
-const bureauCount = (value) => BUREAUS.filter((bureau) => new RegExp(bureau, 'i').test(value || '')).length;
+const NEGATIVE_LANGUAGE = /collection(?: account)?|charge.?off|transferred\/?charged off|late payment|\b(?:30|60|90|120|150)\s*(?:days?\s*)?late\b|derogatory|delinquent|\brepo(?:ssession)?\b|repossession|foreclosure|bankruptcy|settlement|past due|profit and loss|closed by grantor|negative status|days late|\bco\b/i;
+const POSITIVE_LANGUAGE = /\bopen\b|\bcurrent\b|\bpaid\b|paid as agreed|pays as agreed|never late|satisfactory|revolving|installment|\bok\b/i;
+const bureauCount = (value) => BUREAUS.filter((bureau) => new RegExp(`${bureau}|${bureau === 'TransUnion' ? 'TU' : bureau === 'Experian' ? 'EX' : 'EQ'}`, 'i').test(value || '')).length;
 
 function cloneData(source) {
   return typeof structuredClone === 'function' ? structuredClone(source) : JSON.parse(JSON.stringify(source));
