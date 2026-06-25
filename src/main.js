@@ -36,10 +36,9 @@ const moneyOrNumber = (value) => String(value || '').match(/\$?\d[\d,]*(?:\.\d{2
 const formatBureauValues = (values) => values.length >= 3 ? `TU ${values[0]} | EX ${values[1]} | EQ ${values[2]}` : (values[0] || '');
 const labelText = (key) => key.replace(/([A-Z])/g, ' $1').replace(/^./, c => c.toUpperCase());
 function detectProvider(text) {
-  if (/identity\s*iq|identityiq/i.test(text)) return 'IdentityIQ';
+  if (/identity\s*iq|identityiq|credit\s+report\s+date|transunion|experian|equifax|account\s+summary|credit\s+score/i.test(text)) return 'IdentityIQ';
   if (/credit\s*hero/i.test(text)) return 'Credit Hero';
   if (/smart\s*credit|smartcredit/i.test(text)) return 'SmartCredit';
-  if (/Quick Links\s*:\s*Credit Score|Vantage Score|Account Summary[\s\S]*Account History/i.test(text)) return 'IdentityIQ';
   return 'Unknown';
 }
 function getSection(text, title, nextTitles = []) {
@@ -122,7 +121,25 @@ function isAccountStartCandidate(line) {
   if (/^(credit score|personal information|account summary|account history|inquiries|public information)$/i.test(line)) return false;
   return /[A-Za-z0-9]{2,}/.test(line) && line.length <= 90;
 }
-function nextValueInBlock(block, labels) { return valueAfterLabel(block.join('\n'), labels); }
+function nextValueInBlock(block, labels) {
+  for (let i = 0; i < block.length; i++) {
+    for (const label of labels) {
+      const re = new RegExp(`^${escapeReg(label)}\\s*[:#-]?\\s*(.*)$`, 'i');
+      const hit = block[i].match(re);
+      if (!hit) continue;
+      const inline = clean(hit[1]);
+      if (inline) return inline;
+      for (let j = i + 1; j < Math.min(block.length, i + 5); j++) {
+        const next = clean(block[j]);
+        if (!next) continue;
+        if (labels.some((candidate) => new RegExp(`^${escapeReg(candidate)}\\s*[:#-]?\\s*$`, 'i').test(next))) continue;
+        if (REPORT_LABELS.has(next.toLowerCase()) && !/^(current|ok)$/i.test(next)) return '';
+        return next;
+      }
+    }
+  }
+  return '';
+}
 function findNextAccountType(lines, start) {
   for (let i = start; i < lines.length; i++) if (isAccountType(lines[i])) return i;
   return lines.length;
@@ -137,13 +154,14 @@ function parseTradelines(text) {
     if (!creditor || !block.length) return;
     const joined = block.join('\n');
     const type = nextValueInBlock(block, ['Account Type']) || (block.find(isAccountType) || '');
-    const status = nextValueInBlock(block, ['Status', 'Account Status', 'Account Rating']);
+    const status = nextValueInBlock(block, ['Account Status', 'Status', 'Account Rating']);
     const paymentStatus = nextValueInBlock(block, ['Payment Status']);
     const balance = nextValueInBlock(block, ['Balance Owed', 'Current Balance', 'Balance', 'High Balance']);
     const creditLimit = nextValueInBlock(block, ['Credit Limit', 'Credit Line', 'Limit']);
     const monthlyPayment = nextValueInBlock(block, ['Monthly Payment', 'Payment Amount']);
     const originalCreditor = nextValueInBlock(block, ['Original Creditor']);
     const bureaus = nextValueInBlock(block, ['Bureau Reporting']) || BUREAUS.filter((b) => new RegExp(b, 'i').test(joined)).join(', ');
+    const notes = nextValueInBlock(block, ['Remarks', 'Notes', 'Comments']);
     const statusText = clean(status || paymentStatus || type);
     const negative = NEGATIVE_LANGUAGE.test(`${creditor} ${type} ${statusText} ${paymentStatus} ${joined}`);
     const positive = !negative && POSITIVE_LANGUAGE.test(`${creditor} ${type} ${statusText} ${paymentStatus} ${joined}`);
@@ -160,6 +178,7 @@ function parseTradelines(text) {
       paymentStatus,
       bureauReporting: bureaus,
       bureaus,
+      notes,
       isPositive: positive,
       isNegative: negative,
       raw: joined
@@ -214,7 +233,10 @@ function parseTradelines(text) {
     const creditLimit = nextValueInBlock(block, ['Credit Limit', 'Credit Line', 'Limit']);
     const monthlyPayment = nextValueInBlock(block, ['Monthly Payment', 'Payment Amount']);
     const bureaus = BUREAUS.filter((b) => new RegExp(b, 'i').test(joined)).join(', ');
-    accounts.push({ id: accounts.length + 1, creditor, type, status: clean(paymentStatus || accountStatus || rating || type), paymentStatus, balance, creditLimit, monthlyPayment, bureaus, raw: joined });
+    const status = clean(paymentStatus || accountStatus || rating || type);
+    const negative = NEGATIVE_LANGUAGE.test(`${creditor} ${type} ${status} ${paymentStatus} ${joined}`);
+    const positive = !negative && POSITIVE_LANGUAGE.test(`${creditor} ${type} ${status} ${paymentStatus} ${joined}`);
+    accounts.push({ id: accounts.length + 1, creditor, accountType: type, type, status, paymentStatus, balance, creditLimit, monthlyPayment, bureauReporting: bureaus, bureaus, notes: nextValueInBlock(block, ['Remarks', 'Notes', 'Comments']), isPositive: positive, isNegative: negative, raw: joined });
     i = nextTypeIndex - 1;
   }
   return accounts;
@@ -233,7 +255,7 @@ function parseReport(text) {
     scores: parseScores(text), accountSummary, tradelines, negativeItems, positiveItems,
     collections: negativeItems.filter((item) => /collection/i.test(`${item.type} ${item.status} ${item.raw}`)),
     derogatoryItems: negativeItems.filter((item) => /derogatory|charge.?off|collection|late|delinquent|repossession|foreclosure/i.test(`${item.type} ${item.status} ${item.raw}`)),
-    bureauDifferences: tradelines.filter((t) => t.bureaus && t.bureaus.split(',').length < 3).map((t) => `${t.creditor}: appears to vary by bureau (${t.bureaus || 'bureau not specified'}).`),
+    bureauDifferences: tradelines.filter((t) => bureauCount(t.bureaus || t.bureauReporting) > 0 && bureauCount(t.bureaus || t.bureauReporting) < 3).map((t) => `${t.creditor}: appears to vary by bureau (${t.bureaus || t.bureauReporting || 'bureau not specified'}).`),
     rebuildNeeds: []
   };
 }
@@ -251,7 +273,7 @@ const confirmedNumber = (value) => {
 };
 const formatMoney = (value) => displayValue(value);
 const scoreValue = (data, bureau) => displayValue(data.scores[bureau]);
-const itemText = (item) => `${item.creditor || ''} ${item.type || ''} ${item.status || ''} ${item.raw || ''}`;
+const itemText = (item) => `${item.creditor || ''} ${item.accountType || item.type || ''} ${item.status || ''} ${item.paymentStatus || ''} ${item.originalCreditor || ''} ${item.notes || ''} ${item.raw || ''}`;
 const isVerifiedItem = (item) => Boolean(clean(item?.creditor) || clean(item?.type) || clean(item?.balance) || clean(item?.status) || clean(item?.raw));
 const isCollection = (item) => /collection/i.test(itemText(item));
 const isChargeOff = (item) => /charge.?off|\bco\b/i.test(itemText(item));
@@ -272,8 +294,9 @@ const verifiedCount = (value) => {
 const hasPublicRecords = (data) => verifiedCount(data.accountSummary.publicRecords);
 const hasInquiries = (data) => verifiedCount(data.accountSummary.inquiries);
 const hasThinFile = (data) => data.tradelines.length > 0 && data.positiveItems.length < 2;
-const NEGATIVE_LANGUAGE = /collection|charge.?off|late payment|\b(?:30|60|90|120|150)\s*(?:days?\s*)?late\b|derogatory|delinquent|\brepo(?:ssession)?\b|foreclosure|bankruptcy|settlement|past due|closed by grantor|negative status|days late|\bco\b/i;
-const POSITIVE_LANGUAGE = /open|current|paid as agreed|pays as agreed|never late|satisfactory|\bok\b/i;
+const NEGATIVE_LANGUAGE = /collection(?: account)?|charge.?off|transferred\/?charged off|late payment|\b(?:30|60|90|120|150)\s*(?:days?\s*)?late\b|derogatory|delinquent|\brepo(?:ssession)?\b|foreclosure|bankruptcy|settlement|past due|profit and loss|closed by grantor|negative status|days late|\bco\b/i;
+const POSITIVE_LANGUAGE = /open|current|paid as agreed|pays as agreed|never late|satisfactory|revolving|installment|\bok\b/i;
+const bureauCount = (value) => BUREAUS.filter((bureau) => new RegExp(bureau, 'i').test(value || '')).length;
 
 function cloneData(source) {
   return typeof structuredClone === 'function' ? structuredClone(source) : JSON.parse(JSON.stringify(source));
@@ -294,7 +317,7 @@ function classifyNegative(item) {
   return NEGATIVE_LANGUAGE.test(itemText(item));
 }
 function classifyPositive(item) {
-  return !isCollection(item) && !isChargeOff(item) && POSITIVE_LANGUAGE.test(itemText(item));
+  return !classifyNegative(item) && POSITIVE_LANGUAGE.test(itemText(item));
 }
 function buildApprovedAnalysis(current) {
   const source = cloneData(current || emptyAnalysis());
@@ -500,7 +523,17 @@ function accountControls(key, row, index) { return el('div', { class: 'controls'
   el('button', { class: 'secondary small', text: 'Mark as Negative', onclick: () => markAccount(row, 'negative') }),
   el('button', { class: 'secondary small', text: 'Mark as Both Positive and Negative', onclick: () => markAccount(row, 'both') })
 ]); }
-function listEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} organized yet.` })); analysis[key].forEach((row, i) => { const editor = el('div', { class: 'account-editor collapsed', id: `${key}-${i}` }, [accountFields(row, (fieldName, value) => { analysis[key][i][fieldName] = value; touchAnalysis(); })]); box.append(el('div', { class: 'account-card' }, [el('strong', { text: row.creditor || 'Account needs creditor name' }), el('p', { class: 'muted', text: `${displayValue(row.type)} • ${displayValue(row.status)} • Balance: ${formatMoney(row.balance)}` }), accountControls(key, row, i), editor])); }); return box; }
+function accountSummaryLine(row) {
+  return [
+    displayValue(row.type || row.accountType),
+    `Balance: ${formatMoney(row.balance)}`,
+    `Status: ${displayValue(row.status)}`,
+    `Payment: ${displayValue(row.paymentStatus)}`,
+    `Bureaus: ${displayValue(row.bureauReporting || row.bureaus)}`,
+    row.notes ? `Notes: ${row.notes}` : ''
+  ].filter(Boolean).join(' • ');
+}
+function listEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} organized yet.` })); analysis[key].forEach((row, i) => { const editor = el('div', { class: 'account-editor collapsed', id: `${key}-${i}` }, [accountFields(row, (fieldName, value) => { analysis[key][i][fieldName] = value; touchAnalysis(); })]); box.append(el('div', { class: 'account-card' }, [el('strong', { text: row.creditor || 'Account needs creditor name' }), el('p', { class: 'muted', text: accountSummaryLine(row) }), accountControls(key, row, i), editor])); }); return box; }
 function textListEditor(title, key) { const box = el('div', { class: 'subcard' }, [el('h3', { text: title })]); if (!analysis[key].length) box.append(el('p', { class: 'muted', text: `No verified ${title.toLowerCase()} organized yet.` })); analysis[key].forEach((row, i) => box.append(input(row, (v) => { analysis[key][i] = v; touchAnalysis(); }))); return box; }
 function field(label, value) { return el('div', { class: 'metric' }, [el('span', { text: label }), el('strong', { text: String(value) })]); }
 function itemCard(title, rows, extra = []) { return el('article', { class: 'strategy-item' }, [el('h4', { text: title }), ...rows.map(([label, value]) => field(label, value)), ...extra]); }
